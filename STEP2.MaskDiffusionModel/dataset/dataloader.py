@@ -254,6 +254,7 @@ class GenerateTumorHeatmapd(MapTransform):
         else:
             # 1. Get exact X, Y, Z centroid
             centroid = indices.float().mean(dim=0)
+            print(f"CENTROID: {centroid}")
 
             # 2. Generate 3D grid
             X, Y, Z = binary_mask.shape
@@ -327,8 +328,6 @@ def get_loader(args):
                 max_k=3,
             ),
 
-
-
             # 5. Compute TSDF on the cropped mask patches
             # NOTE: Heatmap is NOT included here. We want it to stay a 0-to-1 Gaussian.
             ComputeTSDFd(keys=["tumor_mask", "organ_mask"]),
@@ -341,45 +340,60 @@ def get_loader(args):
     )
     val_transforms = Compose(
         [
-            LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"]),
-            EnsureChannelFirstd(keys=["image", "tumor_mask", "organ_mask"]),
-            Orientationd(keys=["image", "tumor_mask",
-                         "organ_mask"], axcodes="RAS"),
+            LoadImageh5d(keys=["tumor_mask", "organ_mask"]),
+            EnsureChannelFirstd(keys=["tumor_mask", "organ_mask"]),
 
+            # 1. Restructure the full volume
+            Orientationd(keys=["tumor_mask", "organ_mask"], axcodes="RAS"),
             Spacingd(
-                keys=["image", "tumor_mask", "organ_mask"],
+                keys=["tumor_mask", "organ_mask"],
                 pixdim=(args.space_x, args.space_y, args.space_z),
-                mode=("bilinear", "nearest", "nearest"),
+                mode=("nearest", "nearest"),
             ),
 
-            ScaleIntensityRanged(
-                keys=["image"],  # Only CT image is scaled
-                a_min=args.a_min,
-                a_max=args.a_max,
-                b_min=args.b_min,
-                b_max=args.b_max,
-                clip=True,
+            # Generates the heatmap on the newly cropped, smaller volume.
+            GenerateTumorHeatmapd(
+                ref_key="tumor_mask",
+                out_key="heatmap", 
+                sigma=8.0
             ),
 
-            CropForegroundd(keys=["image", "tumor_mask",
-                            "organ_mask"], source_key="image"),
+            # 2. CROP FOREGROUND FIRST 
+            # Cut away the empty background before doing heavy math.
+            # (Only the masks exist at this point)
+            CropForegroundd(
+                keys=["tumor_mask", "organ_mask", "heatmap"], 
+                source_key="organ_mask"
+            ),
 
+            
+            
+            # 4. PAD TO ROI SIZE
+            # Now that all three keys exist, pad them together to guarantee 
+            # they are at least the size of your patch crop.
+            SpatialPadd(
+                keys=["tumor_mask", "organ_mask", "heatmap"],
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                mode="constant",
+            ),
+          
+            # 5. EXTRACT THE PATCH
             RandCropByLabelClassesd(
-                keys=["image", "tumor_mask", "organ_mask"],
+                keys=["tumor_mask", "organ_mask", "heatmap"],
                 label_key="tumor_mask",
                 spatial_size=(args.roi_x, args.roi_y, args.roi_z),
-                ratios=[0, 1],
+                ratios=[1, 10000],      
                 num_classes=2,
-                num_samples=args.num_samples,
-                image_key="image",
-                image_threshold=0,
+                num_samples=args.num_samples, 
             ),
 
-            ToTensord(keys=["image", "tumor_mask", "organ_mask"]),
+            # 6. CALCULATE TSDF ON THE SMALL PATCH
+            ComputeTSDFd(keys=["tumor_mask", "organ_mask"]),
 
+            # 7. FINALIZE
+            ToTensord(keys=["tumor_mask", "organ_mask", "heatmap"]),
         ]
     )
-
     # breakpoint()
 
     # breakpoint()
@@ -449,22 +463,35 @@ def get_loader(args):
         import json
         from pandas.api.types import is_numeric_dtype
 
-        normalization_stats = {}
-        for key in train_input.columns:
-            # Exclude metadata and pipeline structural columns from Z-scoring
-            if key in ['volume_bin', 'sample_weight', 'organ', 'tumor_mask', 'organ_mask', 'capped_volume']:
-                continue
+        stats_file = "dataset_norm_stats.json"
+        exclude_cols = ['volume_bin', 'sample_weight', 'organ',
+                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task']
 
-            if is_numeric_dtype(train_input[key]):
-                mean_val = float(train_input[key].mean())
-                std_val = float(train_input[key].std() + 1e-6)
+        if os.path.exists(stats_file):
+            print("Loading existing normalization statistics...")
+            with open(stats_file, "r") as f:
+                normalization_stats = json.load(f)
+        else:
+            print("Generating new normalization statistics...")
+            normalization_stats = {}
+            for key in train_input.columns:
+                if key in exclude_cols or not is_numeric_dtype(train_input[key]):
+                    continue
 
-                normalization_stats[key] = {"mean": mean_val, "std": std_val}
-                train_input[key] = (train_input[key] - mean_val) / std_val
+                normalization_stats[key] = {
+                    "mean": float(train_input[key].mean()),
+                    "std": float(train_input[key].std() + 1e-6)
+                }
 
-        # Save for inference/evaluation
-        with open("dataset_norm_stats.json", "w") as f:
-            json.dump(normalization_stats, f, indent=4)
+            with open(stats_file, "w") as f:
+                json.dump(normalization_stats, f, indent=4)
+            print("Saved new normalization data.")
+
+        # Apply the normalization (using loaded or newly generated stats)
+        for key, stats in normalization_stats.items():
+            if key in train_input.columns:
+                train_input[key] = (train_input[key] -
+                                    stats["mean"]) / stats["std"]
 
         # 5. CONVERT TO DICTIONARY RECORDS FOR MONAI
         data_dicts_train = train_input.to_dict("records")
@@ -496,30 +523,70 @@ def get_loader(args):
         # return train_loader
 
     if args.phase == 'validation':
-        # validation dict part
-        val_img = []
-        val_lbl = []
-        val_name = []
-        for item in args.dataset_list:
-            for line in open(os.path.join(args.data_txt_path,  item, 'real_huge_train_0.txt')):
-                name = line.strip().split()[1].split('.')[0]
-                val_img.append(args.data_root_path + line.strip().split()[0])
-                val_lbl.append(args.data_root_path + line.strip().split()[1])
-                val_name.append(name)
-        data_dicts_val = [{'image': image, 'label': label, 'name': name}
-                          for image, label, name in zip(val_img, val_lbl, val_name)]
+        # 1. Read the validation CSV
+        val_input = pd.read_csv(os.path.join(
+            args.data_txt_path, args.dataset_list, f'{args.datafile}'))
+
+        # 2. Generate file paths
+        def parseOrganName(organName):
+            if (organName == "gallbladder"):
+                return 'gall_bladder'
+            return organName
+
+        val_input["organ_mask"] = val_input.apply(
+            lambda row: os.path.join(args.organ_segmentations_root_path, str(
+                row["bdmap_id"]), "segmentations", f"{parseOrganName(row['organ'])}.nii.gz"),
+            axis=1
+        )
+
+        val_input["tumor_mask"] = val_input.apply(
+            lambda row: os.path.join(args.segmentations_root_path, str(
+                row["bdmap_id"]), "segmentations", f"{row['organ']}_lesion.nii.gz"),
+            axis=1
+        )
+
+        # 3. Map string labels to integers
+        organ_mapping = {
+            'spleen': 0, 'bladder': 1, 'gallbladder': 2, 'esophagus': 3,
+            'stomach': 4, 'duodenum': 5, 'colon': 6, 'prostate': 7, 'uterus': 8
+        }
+        val_input = val_input[val_input["organ"].isin(
+            list(organ_mapping.keys()))]
+        val_input["organ"] = val_input.apply(
+            lambda row: organ_mapping[row["organ"]], axis=1)
+
+        # 4. Apply Normalization (Strictly LOADING stats, never generating them)
+        import json
+        stats_file = "dataset_norm_stats.json"
+
+        if not os.path.exists(stats_file):
+            raise FileNotFoundError(
+                "Normalization stats missing. Run training phase first to generate dataset_norm_stats.json.")
+
+        with open(stats_file, "r") as f:
+            normalization_stats = json.load(f)
+
+        for key, stats in normalization_stats.items():
+            if key in val_input.columns:
+                val_input[key] = (
+                    val_input[key] - stats["mean"]) / stats["std"]
+
+        # 5. Convert to MONAI dictionary format
+        data_dicts_val = val_input.to_dict("records")
         print('val len {}'.format(len(data_dicts_val)))
 
+        # 6. Build the Dataset and Loader (No Weighted Sampler needed)
         if args.cache_dataset:
             val_dataset = CacheDataset(
                 data=data_dicts_val, transform=val_transforms, cache_rate=args.cache_rate)
         else:
             val_dataset = Dataset(data=data_dicts_val,
                                   transform=val_transforms)
+
         val_loader = DataLoader(
-            val_dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=list_data_collate)
+            val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=list_data_collate)
+
         return val_loader, val_transforms, len(val_dataset)
-        # return val_loader
 
 
 def get_key(name):
