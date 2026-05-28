@@ -1,11 +1,13 @@
 name: synt
 image_channels: 1
 
-dataset_list: 'AbdomenAtlasPro'
-data_root_path: ''
+dataset_list: 'AbdomenAtlasProTrain'
+data_root_path: '/projects/bodymaps/Data'
+img_path: image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+seg_path: mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
 data_txt_path: cross_eval/recon/
-dist: False
-batch_size: 16
+dist: True
+batch_size: 2
 num_workers: 16
 
 a_min: -175 # -175
@@ -15,11 +17,8 @@ b_max: 1.0
 space_x: 1.0
 space_y: 1.0
 space_z: 1.0
-roi_x: 96
-roi_y: 96
-roi_z: 96
-num_samples: 2
+roi_x: 128
+roi_y: 128
+roi_z: 128
+num_samples: 1
 phase: train
-uniform_sample: False
-cache_dataset: False
-cache_rate: 0.05

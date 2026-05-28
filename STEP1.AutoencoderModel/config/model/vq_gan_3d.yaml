@@ -1,17 +1,17 @@
 seed: 1234
 num_workers: 16
 
-gpus: 1
+gpus: 2
 accumulate_grad_batches: 1
 default_root_dir: checkpoints/vq_gan/
-default_root_dir_postfix: 'abdomen_atlas_140k'
+default_root_dir_postfix: 'abdomen_atlas_140k_v2'
 resume: False
 resume_version: 0
 resume_from_checkpoint: ~
 pretrained_checkpoint: ~
 max_steps: 3000
 max_epochs: -1
-precision: 16
+precision: bf16-mixed
 gradient_clip_val: 1.0
 
 embedding_dim: 8

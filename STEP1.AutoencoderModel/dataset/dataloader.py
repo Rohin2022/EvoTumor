@@ -1,6 +1,6 @@
 from monai.transforms import (
     AsDiscrete,
-    EnsureChannelFirstD,
+    EnsureChannelFirstd,
     Compose,
     CropForegroundd,
     LoadImaged,
@@ -42,71 +42,7 @@ from monai.data.image_reader import ImageReader
 from monai.utils.enums import PostFix
 DEFAULT_POST_FIX = PostFix.meta()
 
-class UniformDataset(Dataset):
-    def __init__(self, data, transform, datasetkey):
-        super().__init__(data=data, transform=transform)
-        self.dataset_split(data, datasetkey)
-        self.datasetkey = datasetkey
-    
-    def dataset_split(self, data, datasetkey):
-        self.data_dic = {}
-        for key in datasetkey:
-            self.data_dic[key] = []
-        for img in data:
-            key = get_key(img['name'])
-            self.data_dic[key].append(img)
-        
-        self.datasetnum = []
-        for key, item in self.data_dic.items():
-            assert len(item) != 0, f'the dataset {key} has no data'
-            self.datasetnum.append(len(item))
-        self.datasetlen = len(datasetkey)
-    
-    def _transform(self, set_key, data_index):
-        data_i = self.data_dic[set_key][data_index]
-        return apply_transform(self.transform, data_i) if self.transform is not None else data_i
-    
-    def __getitem__(self, index):
-        ## the index generated outside is only used to select the dataset
-        ## the corresponding data in each dataset is selelcted by the np.random.randint function
-        set_index = index % self.datasetlen
-        set_key = self.datasetkey[set_index]
-        data_index = np.random.randint(self.datasetnum[set_index], size=1)[0]
-        return self._transform(set_key, data_index)
 
-
-class UniformCacheDataset(CacheDataset):
-    def __init__(self, data, transform, cache_rate, datasetkey):
-        super().__init__(data=data, transform=transform, cache_rate=cache_rate)
-        self.datasetkey = datasetkey
-        self.data_statis()
-    
-    def data_statis(self):
-        data_num_dic = {}
-        for key in self.datasetkey:
-            data_num_dic[key] = 0
-        for img in self.data:
-            key = get_key(img['name'])
-            data_num_dic[key] += 1
-
-        self.data_num = []
-        for key, item in data_num_dic.items():
-            assert item != 0, f'the dataset {key} has no data'
-            self.data_num.append(item)
-        
-        self.datasetlen = len(self.datasetkey)
-    
-    def index_uniform(self, index):
-        ## the index generated outside is only used to select the dataset
-        ## the corresponding data in each dataset is selelcted by the np.random.randint function
-        set_index = index % self.datasetlen
-        data_index = np.random.randint(self.data_num[set_index], size=1)[0]
-        post_index = int(sum(self.data_num[:set_index]) + data_index)
-        return post_index
-
-    def __getitem__(self, index):
-        post_index = self.index_uniform(index)
-        return self._transform(post_index)
 class LoadImaged_BodyMap(MapTransform):
     def __init__(
         self,
@@ -140,56 +76,94 @@ class LoadImaged_BodyMap(MapTransform):
 
     def __call__(self, data, reader: Optional[ImageReader] = None):
         d = dict(data)
+        # print(d['image'])
         for key, meta_key, meta_key_postfix in self.key_iterator(d, self.meta_keys, self.meta_key_postfix):
             try:
-                loaded_data = self._loader(d[key], reader)
-                
-                # Check for the corrupted file condition immediately
-                if not self._loader.image_only and not isinstance(loaded_data, (tuple, list)):
-                    raise RuntimeError(f"Corrupted or invalid NIfTI file: {d[key]}")
-                    
+                data = self._loader(d[key], reader)
             except Exception as e:
-                # Log it, then RAISE so the Dataset wrapper can catch it
-                print(f"\n[WARNING] Skipping bad file: {d.get('name', d[key])} | Error: {e}")
-                raise RuntimeError("Triggering dataset skip")
-                
+                print("=" * 80)
+                print("FAILED CASE:", d.get("name"))
+                print("IMAGE PATH:", d.get(key))
+                print("ERROR:", repr(e))
+                print("=" * 80)
+                raise
+
             if self._loader.image_only:
-                d[key] = loaded_data
+                d[key] = data
             else:
-                d[key] = loaded_data[0]
+                if not isinstance(data, (tuple, list)):
+                    raise ValueError("loader must return a tuple or list (because image_only=False was used).")
+                d[key] = data[0]
+                if not isinstance(data[1], dict):
+                    raise ValueError("metadata must be a dict.")
                 meta_key = meta_key or f"{key}_{meta_key_postfix}"
                 if meta_key in d and not self.overwriting:
-                    raise KeyError(f"Metadata with key {meta_key} already exists.")
-                d[meta_key] = loaded_data[1]
-                
+                    raise KeyError(f"Metadata with key {meta_key} already exists and overwriting=False.")
+                d[meta_key] = data[1]
+
+        organ_lbl, meta_information = self.label_transfer(d['label'], d['image'].shape)
+        
+        if hasattr(d['image'], "meta"):
+            from monai.data.meta_tensor import MetaTensor
+            
+            # If meta_information exists and is a dictionary/MetaTensor meta, use it.
+            # Otherwise, safely fallback to the image's metadata.
+            chosen_meta = deepcopy(meta_information) if meta_information is not None else deepcopy(d['image'].meta)
+
+            d['label'] = MetaTensor(
+                organ_lbl, 
+                meta=chosen_meta
+            )
+        else:
+            d['label'] = organ_lbl
+            
+        d['label_meta_dict'] = meta_information
         return d
 
     def label_transfer(self, lbl_dir, shape):
         organ_lbl = np.zeros(shape)
-        
-        if os.path.exists(lbl_dir + 'liver' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'liver' + '.nii.gz')
-            organ_lbl[array > 0] = 1
-        if os.path.exists(lbl_dir + 'pancreas' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'pancreas' + '.nii.gz')
-            organ_lbl[array > 0] = 2
-        if os.path.exists(lbl_dir + 'kidney_left' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'kidney_left' + '.nii.gz')
-            organ_lbl[array > 0] = 3
-        if os.path.exists(lbl_dir + 'kidney_right' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'kidney_right' + '.nii.gz')
-            organ_lbl[array > 0] = 3
-        if os.path.exists(lbl_dir + 'liver_tumor' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'liver_tumor' + '.nii.gz')
-            organ_lbl[array > 0] = 4
-        if os.path.exists(lbl_dir + 'pancreas_tumor' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'pancreas_tumor' + '.nii.gz')
-            organ_lbl[array > 0] = 5
-        if os.path.exists(lbl_dir + 'pancreas_tumor' + '.nii.gz'):
-            array, mata_infomation = self._loader(lbl_dir + 'kidney_tumor' + '.nii.gz')
-            organ_lbl[array > 0] = 6
 
-        return organ_lbl, mata_infomation
+        organ_mapping = {
+            # Healthy Organs
+            'spleen': 1,
+            'bladder': 2,
+            'gall_bladder': 3,
+            'esophagus': 4,
+            'stomach': 5,
+            'duodenum': 6,
+            'colon': 7,
+            'prostate': 8,
+            'uterus': 9,
+            
+            # Lesions
+            'spleen_lesion': 10,
+            'bladder_lesion': 11,
+            'gallbladder_lesion': 12,
+            'esophagus_lesion': 13,
+            'stomach_lesion': 14,
+            'duodenum_lesion': 15,
+            'colon_lesion': 16,
+            'prostate_lesion': 17,
+            'uterus_lesion': 18
+        }
+        
+        meta_information = None # Initialize in case no files are found in the directory
+
+        for organ_name, label_idx in organ_mapping.items():
+            file_path = os.path.join(lbl_dir, f"{organ_name}.nii.gz")
+            
+            if os.path.exists(file_path):
+                try:
+                    array, meta_information = self._loader(file_path)
+                except Exception as e:
+                    print(f"Failed organ file: {file_path}")
+                    raise e
+                organ_lbl[array > 0] = label_idx
+
+
+        return organ_lbl, meta_information
+
+
 
 class LoadImageh5d(MapTransform):
     def __init__(
@@ -260,7 +234,11 @@ class SafeDataset(TorchDataset):
         for _ in range(10):
             try:
                 return self.dataset[index]
-            except Exception:
+            except Exception as e:
+                print("=============")
+                print(f"FAILED TO LOAD: {index}")
+                print(e)
+                print("=============")
                 # The transform failed. Pick a new random index and try again.
                 index = random.randint(0, len(self.dataset) - 1)
         
@@ -276,17 +254,13 @@ def get_loader(args):
     train_transforms = Compose(
         [
             LoadImaged_BodyMap(keys=["image"]),
-
-            EnsureChannelFirstD(keys=["image"]),
-
-            Orientationd(keys=["image"], axcodes="RAS"),
-
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(
-                keys=["image"],
+                keys=["image", "label"],
                 pixdim=(args.space_x, args.space_y, args.space_z),
-                mode="bilinear",
-            ),
-
+                mode=("bilinear", "nearest"),
+            ), # process h5 to here
             ScaleIntensityRanged(
                 keys=["image"],
                 a_min=args.a_min,
@@ -295,40 +269,36 @@ def get_loader(args):
                 b_max=args.b_max,
                 clip=True,
             ),
-
-            # removed SpatialPadd + RandCropByPosNegLabeld dependency
-            # replace with mask-free cropping
-            SpatialPadd(keys=["image"], spatial_size=(args.roi_x, args.roi_y, args.roi_z), mode=["minimum"]),
-
-            RandSpatialCropd(
-                keys=["image"],
-                roi_size=(args.roi_x, args.roi_y, args.roi_z),
-                random_size=False,
+            SpatialPadd(keys=["image", "label"], spatial_size=(args.roi_x, args.roi_y, args.roi_z), mode=["minimum", "constant"]),
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z), 
+                pos=20,
+                neg=1,
+                num_samples=args.num_samples,
+                image_key="image",
+                image_threshold=-1,
             ),
-
             RandRotate90d(
-                keys=["image"],
+                keys=["image", "label"],
                 prob=0.10,
                 max_k=3,
             ),
-
-            ToTensord(keys=["image"]),
+            ToTensord(keys=["image", "label"]),
         ]
     )
+
     val_transforms = Compose(
         [
             LoadImageh5d(keys=["image"]),
-
-            EnsureChannelFirstD(keys=["image"]),
-
-            Orientationd(keys=["image"], axcodes="RAS"),
-
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(
-                keys=["image"],
+                keys=["image", "label"],
                 pixdim=(args.space_x, args.space_y, args.space_z),
-                mode="bilinear",
-            ),
-
+                mode=("bilinear", "nearest"),
+            ), 
             ScaleIntensityRanged(
                 keys=["image"],
                 a_min=args.a_min,
@@ -337,14 +307,18 @@ def get_loader(args):
                 b_max=args.b_max,
                 clip=True,
             ),
-
-            RandSpatialCropd(
-                keys=["image"],
-                roi_size=(args.roi_x, args.roi_y, args.roi_z),
-                random_size=False,
+            SpatialPadd(keys=["image", "label"], spatial_size=(args.roi_x, args.roi_y, args.roi_z), mode='constant'),
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                pos=2,
+                neg=0,
+                num_samples=args.num_samples,
+                image_key="image",
+                image_threshold=-1,
             ),
-
-            ToTensord(keys=["image"]),
+            ToTensord(keys=["image", "label"]),
         ]
     )
 
@@ -353,25 +327,26 @@ def get_loader(args):
         train_lbl=[]
         train_name=[]
         for line in open(os.path.join(args.data_txt_path,  args.dataset_list+'.txt')):
-            name = line.strip().split('\t')[0]
-            train_img.append(os.path.join(args.data_root_path, name))
-            train_lbl.append(os.path.join(args.data_root_path, name + '/segmentations/'))
+            name = line.strip()
+            train_img.append(os.path.join(args.data_root_path, args.img_path, name + '/ct.nii.gz'))
+            train_lbl.append(os.path.join(args.data_root_path, args.seg_path, name + '/segmentations/'))
             train_name.append(name)
-        data_dicts_train = [{'image': image, 'name': name}
+
+        
+        data_dicts_train = [{'image': image, 'label': label, 'name': name}
                     for image, label, name in zip(train_img, train_lbl, train_name)]
         print('train len {}'.format(len(data_dicts_train)))
         # data_dicts_train=data_dicts_train[:10]
         # breakpoint()
     
-
-        if args.uniform_sample:
-            train_dataset = UniformDataset(data=data_dicts_train, transform=train_transforms, datasetkey=args.datasetkey)
-        else:
-            train_dataset = Dataset(data=data_dicts_train, transform=train_transforms)
+        train_dataset = Dataset(data=data_dicts_train, transform=train_transforms)
 
         train_dataset = SafeDataset(train_dataset)
 
-        train_sampler = DistributedSampler(dataset=train_dataset, even_divisible=True, shuffle=True) if args.dist else None
+        #train_sampler = DistributedSampler(dataset=train_dataset, even_divisible=True, shuffle=True) if args.dist else None
+        train_sampler = None
+
+        
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers, 
                                     collate_fn=list_data_collate, sampler=train_sampler, pin_memory=True, persistent_workers=True, prefetch_factor=4)
         return train_loader, train_sampler, len(train_dataset)    
@@ -390,10 +365,7 @@ def get_loader(args):
                     for image, label, name in zip(val_img, val_lbl, val_name)]
         print('val len {}'.format(len(data_dicts_val)))
     
-        if args.cache_dataset:
-            val_dataset = CacheDataset(data=data_dicts_val, transform=val_transforms, cache_rate=args.cache_rate)
-        else:
-            val_dataset = Dataset(data=data_dicts_val, transform=val_transforms)
+        val_dataset = Dataset(data=data_dicts_val, transform=val_transforms)
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=list_data_collate)
         return val_loader, val_transforms, len(val_dataset)
     

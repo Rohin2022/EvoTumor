@@ -25,6 +25,8 @@ def get_parameter_number(model):
 def run(cfg: DictConfig, args=None):
     pl.seed_everything(cfg.model.seed)
 
+    cfg.model.default_root_dir = os.path.abspath(cfg.model.default_root_dir)
+
     train_dataloader, _, _ = get_loader(cfg.dataset)
     val_dataloader=None
 
@@ -38,7 +40,7 @@ def run(cfg: DictConfig, args=None):
 
     model = VQGAN(cfg)
     get_parameter_number(model)
-    save_step = 100
+    save_step = 500
     callbacks = []
     callbacks.append(ModelCheckpoint(every_n_train_steps=save_step,
                      save_top_k=-1, filename='{epoch}-{step}-{train/recon_loss:.2f}'))
@@ -78,7 +80,8 @@ def run(cfg: DictConfig, args=None):
                     log_folder = 'version_' + str(version_id_used + 1)
 
     if cfg.model.pretrained_checkpoint is not None:
-        model.load_from_checkpoint(cfg.model.pretrained_checkpoint)
+        # Note: Call it on the class (VQGAN) and assign it to the 'model' variable
+        model = VQGAN.load_from_checkpoint(cfg.model.pretrained_checkpoint, cfg=cfg)
         print('load pretrained model:', cfg.model.pretrained_checkpoint)
 
     trainer = pl.Trainer(
@@ -90,6 +93,7 @@ def run(cfg: DictConfig, args=None):
         callbacks=callbacks,
         max_steps=cfg.model.max_steps,
         max_epochs=cfg.model.max_epochs,
+        sync_batchnorm=True,
         precision=cfg.model.precision,
     )
 
