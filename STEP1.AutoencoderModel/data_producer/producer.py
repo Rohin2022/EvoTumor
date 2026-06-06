@@ -103,10 +103,6 @@ class LoadImaged_BodyMap(MapTransform):
         return d
 
     def label_transfer(self, segmentations_list, shape):
-        """
-        segmentations_list is now passed directly from our JSON dictionary 
-        containing only the files that definitely exist.
-        """
         organ_lbl = np.zeros(shape)
 
         organ_mapping = {
@@ -130,7 +126,6 @@ class LoadImaged_BodyMap(MapTransform):
                 print(f"Failed organ file: {file_path}")
                 raise e
             
-            # Clean stripping of meta-tensors
             if hasattr(array, "as_tensor"):
                 array_np = array.as_tensor().numpy()
             elif hasattr(array, "numpy"):
@@ -144,10 +139,6 @@ class LoadImaged_BodyMap(MapTransform):
 
 
 def init_worker(cfg: DictConfig):
-    """
-    Initialize the transform pipeline using Hydra config parameters.
-    Transforms use 'cfg.dataset' properties.
-    """
     global transform_pipeline
     
     transform_pipeline = Compose([
@@ -157,19 +148,14 @@ def init_worker(cfg: DictConfig):
         Spacingd(keys=["image", "label"], pixdim=(cfg.dataset.space_x, cfg.dataset.space_y, cfg.dataset.space_z), mode=("bilinear", "nearest")),
         ScaleIntensityRanged(keys=["image"], a_min=cfg.dataset.a_min, a_max=cfg.dataset.a_max, b_min=cfg.dataset.b_min, b_max=cfg.dataset.b_max, clip=True),
         SpatialPadd(keys=["image", "label"], spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), mode=["minimum", "constant"]),
-        RandCropByPosNegLabeld(keys=["image", "label"], label_key="label", spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), pos=20, neg=1, num_samples=cfg.dataset.num_samples, image_key="image", image_threshold=-1),
+        RandCropByPosNegLabeld(keys=["image", "label"], label_key="label", spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), pos=10, neg=1, num_samples=cfg.producer.num_samples, image_key="image", image_threshold=-1),
         RandRotate90d(keys=["image", "label"], prob=0.10, max_k=3),
         ToTensord(keys=["image", "label"]),
     ])
 
 def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
-    """
-    Infinite producer loop with built-in SafeDataset logic, reading from shared memory,
-    and cleanly terminating once max_batches is reached.
-    """
     random.seed(os.getpid() + int(time.time()))
 
-    # Parse the JSON from the shared memory string once inside the worker
     print(f"[Worker {worker_id}] Unpacking data manifest from shared memory...")
     all_data_dicts = json.loads(shared_json_str.value)
     
@@ -180,7 +166,7 @@ def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
     max_batches = cfg.producer.max_batches
     chunk_size = cfg.producer.chunk_size
     
-    consecutive_failures = 0  # Safety counter
+    consecutive_failures = 0
     
     while True: 
         random.shuffle(all_data_dicts)
@@ -193,7 +179,7 @@ def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
                     print(f"[Worker {worker_id}] Cache target reached ({len(current_files)}/{max_batches} files). Exiting cleanly.")
                     return
             
-            # 2. Process Data (The "Safe" Logic)
+            # 2. Process Data
             try:
                 outputs = transform_pipeline(data_dict)
                 if not isinstance(outputs, list):
@@ -203,17 +189,29 @@ def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
                     pure_image = crop["image"].as_tensor()
                     pure_label = crop["label"].as_tensor()
 
+                    # --- New: Multi-Hot Crop Classification ---
+                    # 1. Find all unique integer values present in this crop
+                    unique_vals = torch.unique(pure_label).long()
+                    
+                    # 2. Initialize a 19-element binary vector (0 to 18)
+                    class_presence = torch.zeros(19, dtype=torch.uint8)
+                    
+                    # 3. Filter out any unexpected values to prevent out-of-bounds indexing
+                    valid_indices = unique_vals[(unique_vals >= 0) & (unique_vals <= 18)]
+                    
+                    # 4. Set the present indices to 1
+                    class_presence[valid_indices] = 1
+                    # ------------------------------------------
+
                     local_batch_buffer.append({
                         "image": pure_image.clone().to(torch.float16), 
-                        "label": pure_label.clone().to(torch.int8) 
+                        "label": pure_label.clone().to(torch.int8),
+                        "contents": class_presence  # Now saves the full binary map!
                     })
 
-                    if worker_id % 24 == 0 and len(local_batch_buffer) % 16 == 0: # log only for a few workers and less
+                    if worker_id % 24 == 0 and len(local_batch_buffer) % 16 == 0:
                         print(f"[Worker {worker_id}] Buffer filling: {len(local_batch_buffer)} / {chunk_size}")
-
-                # --------------------------------
                 
-                # Reset the safety counter upon a successful transform
                 consecutive_failures = 0
                     
             except Exception as e:
@@ -225,14 +223,11 @@ def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
                 consecutive_failures += 1
                 if consecutive_failures >= 10:
                     raise RuntimeError(f"[Worker {worker_id}] Failed 10 consecutive times. Weka storage might be offline.")
-                
-                # Move onto the next file naturally
                 continue
                 
             # 3. Save batched chunk when full
             if len(local_batch_buffer) >= chunk_size:
                 
-                # Pre-write limit check
                 current_files = [f for f in os.listdir(scratch_dir) if f.endswith(".pt")]
                 if len(current_files) >= max_batches:
                     print(f"[Worker {worker_id}] Cache met right before write. Discarding buffer and exiting.")
@@ -243,7 +238,8 @@ def continuous_worker_loop(worker_id, shared_json_str, cfg: DictConfig):
                 
                 batch_dict = {
                     "image": torch.stack([d["image"] for d in process_buffer]),
-                    "label": torch.stack([d["label"] for d in process_buffer])
+                    "label": torch.stack([d["label"] for d in process_buffer]),
+                    "contents": torch.stack([d["contents"] for d in process_buffer]) # Stacks into shape [256, 19]
                 }
                 
                 file_id = f"batch_w{worker_id}_{uuid.uuid4().hex[:8]}.pt"
@@ -267,7 +263,6 @@ def start_producer(cfg: DictConfig):
     print("Allocating shared memory space for manifest string...")
     shared_json_str = mp.Array(ctypes.c_char, raw_text.encode('utf-8'), lock=False)
     
-    # Free the RAM immediately
     del raw_text
 
     num_workers = cfg.producer.num_workers
