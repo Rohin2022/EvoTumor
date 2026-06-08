@@ -1,0 +1,4 @@
+phase: 'train'
+scratch_dir: "/scratch/rpinise1/MultiTumorSynthesis/AutoencoderCache"
+batch_size: 6
+num_workers: 4

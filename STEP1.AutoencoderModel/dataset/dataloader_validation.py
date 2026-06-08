@@ -405,16 +405,6 @@ def get_loader(args):
         return val_loader, val_transforms, len(val_dataset)
     
 
-def get_key(name):
-    ## input: name
-    ## output: the corresponding key
-    dataset_index = int(name[0:2])
-    if dataset_index == 10:
-        template_key = name[0:2] + '_' + name[17:19]
-    else:
-        template_key = name[0:2]
-    return template_key
-
 if __name__ == "__main__":
     train_loader, test_loader = partial_label_dataloader()
     for index, item in enumerate(test_loader):

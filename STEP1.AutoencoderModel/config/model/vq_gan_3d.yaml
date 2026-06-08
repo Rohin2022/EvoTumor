@@ -4,7 +4,7 @@ num_workers: 16
 gpus: 2
 accumulate_grad_batches: 1
 default_root_dir: checkpoints/vq_gan/
-default_root_dir_postfix: 'abdomen_atlas_140k_v3'
+default_root_dir_postfix: 'abdomen_atlas_140k_v4'
 resume: False
 resume_version: 0
 resume_from_checkpoint: ~

@@ -2,3 +2,4 @@ defaults:
   - dataset: synt_ct 
   - model: vq_gan_3d 
   - producer: producer
+  - consumer: consumer

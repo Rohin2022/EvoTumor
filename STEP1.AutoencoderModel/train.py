@@ -10,7 +10,7 @@ from vq_gan_3d.model import VQGAN
 from callbacks import ImageLogger, VideoLogger
 import hydra
 from omegaconf import DictConfig, open_dict
-from dataset.dataloader import get_loader
+from dataset.dataloader_consumer import get_loader
 import argparse
 import logging
 import os
@@ -31,7 +31,7 @@ def run(cfg: DictConfig, args=None):
 
     cfg.model.default_root_dir = os.path.abspath(cfg.model.default_root_dir)
 
-    train_dataloader, _, _ = get_loader(cfg.dataset)
+    train_dataloader = get_loader(cfg.consumer)
     val_dataloader=None
 
     # automatically adjust learning rate
