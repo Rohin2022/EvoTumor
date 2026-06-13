@@ -372,7 +372,7 @@ class Unet3D(nn.Module):
         cond_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        channels=3,
+        channels=129,
         attn_heads=8,
         attn_dim_head=32,
         use_bert_text_cond=False,
@@ -382,7 +382,7 @@ class Unet3D(nn.Module):
         block_type='resnet',
         resnet_groups=8,
         num_organs = 9,
-        num_continuous_conditioners=9
+        num_continuous_conditioners=10
     ):
         super().__init__()
         self.channels = channels
@@ -431,7 +431,7 @@ class Unet3D(nn.Module):
 
         self.tabular_cond_dim = self.num_organs + self.num_continuous_conditioners
 
-        # Total input to the MLP is now: 9 (one-hot organ) + 9 (continuous) = 18
+        # Total input to the MLP is now: 9 (one-hot organ) + 10 (continuous) = 19
         self.tabular_cond_mlp = nn.Sequential(
             nn.Linear(self.tabular_cond_dim, time_dim),
             nn.SiLU(),
@@ -855,38 +855,49 @@ class GaussianDiffusion(nn.Module):
         return loss
 
     def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
-        mask_=(1-mask).detach()
-        masked_img = (img*mask_).detach()
-        masked_img=masked_img.permute(0,1,-1,-3,-2)
-        img=img.permute(0,1,-1,-3,-2)
-        mask=mask.permute(0,1,-1,-3,-2)
+        # 1. Create masks and detached masked images
+        mask_ = (1 - mask).detach()
+        masked_img = (img * mask_).detach()
+        
+        # 2. Permute dimensions (Consider using explicit positive indices instead of -1, -3, -2)
+        masked_img = masked_img.permute(0, 1, -1, -3, -2)
+        img = img.permute(0, 1, -1, -3, -2)
+        mask = mask.permute(0, 1, -1, -3, -2)
 
+        # 3. Process through VQGAN or standard normalization safely
         if isinstance(self.vqgan, VQGAN):
             with torch.no_grad():
-                img = self.vqgan.encode(
-                    img, quantize=False, include_embeddings=True)
-                # normalize to -1 and 1
-                img = ((img - self.vqgan.codebook.embeddings.min()) /
-                     (self.vqgan.codebook.embeddings.max() -
-                      self.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+                # Cache min/max to avoid recalculating 4 times
+                emb_min = self.vqgan.codebook.embeddings.min()
+                emb_max = self.vqgan.codebook.embeddings.max()
+                emb_denom = emb_max - emb_min
+
+                # Encode
+                img = self.vqgan.encode(img, quantize=False, include_embeddings=True)
+                masked_img = self.vqgan.encode(masked_img, quantize=False, include_embeddings=True)
                 
-                masked_img = self.vqgan.encode(
-                    masked_img, quantize=False, include_embeddings=True)
-                # normalize to -1 and 1
-                masked_img = ((masked_img - self.vqgan.codebook.embeddings.min()) /
-                     (self.vqgan.codebook.embeddings.max() -
-                      self.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+                # Normalize
+                img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
+                masked_img = ((masked_img - emb_min) / emb_denom) * 2.0 - 1.0
         else:
-            img = normalize_img(img)
-            masked_img = normalize_img(masked_img)
+            # Wrap in no_grad to prevent tracking gradients on detached tensors
+            with torch.no_grad():
+                img = normalize_img(img)
+                masked_img = normalize_img(masked_img)
             
-        mask = mask*2.0 - 1.0
+        # 4. Condition preparation
+        mask = mask * 2.0 - 1.0
         cc = torch.nn.functional.interpolate(mask, size=masked_img.shape[-3:])
         cond = torch.cat((masked_img, cc), dim=1)
 
-        b, device, img_size, = img.shape[0], img.device, self.image_size
+        # 5. Timestep sampling and loss calculation
+        b, device = img.shape[0], img.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(img, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, *args, **kwargs)
+        
+        return self.p_losses(
+            img, t, cond=cond, tabular_cond=tabular_cond, 
+            null_cond_prob=null_cond_prob, *args, **kwargs
+        )
 
 # trainer class
 
@@ -1009,7 +1020,7 @@ class Trainer(object):
         numerical_features = [
             "attenuation_mean", "attenuation_stdev", "attenuation_delta", # attenuation_delta is (mean_tumor - mean_organ) / std_organ
             "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-            "glcm_contrast", "glcm_autocorrelation", "glcm_idm"
+            "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components"
         ]
 
         # 1. Handle the categorical "organ" feature
@@ -1030,7 +1041,7 @@ class Trainer(object):
         continuous_vector = torch.stack(num_tensors, dim=1)
 
         # 3. Concatenate the one-hot organ with the continuous features
-        # Resulting shape: (Batch, 19)
+        # Resulting shape: (Batch, 18)
         cond_vector = torch.cat([organ_one_hot, continuous_vector], dim=1)
 
         return cond_vector

@@ -1,27 +1,30 @@
-name: liver_tumor_train
+name: multi_tumor_train
 image_channels: 1
 fold: 0
-dataset_list: ['liver_tumor_data_early_fold']
-data_root_path: /mnt/ccvl15/zzhou82/PublicAbdominalData/
-label_root_path: /mnt/ccvl15/qichen/process_label/
-data_txt_path: cross_eval/
+
+dataset_list: 'abdomen_atlas_pro'
+data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer/
+organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+tumor_csv_path: cross_eval/
+tumor_datafile: tumor_metrics_v1.csv
+tumor_masks_datafile: RadiomicsMaskMetricsBadDropped_Train.csv
+
 dist: False
-batch_size: 16
+batch_size: 8
 num_workers: 16
 
-a_min: -175
-a_max: 250
+a_min: -1000
+a_max: 1000
 b_min: -1.0
 b_max: 1.0
 space_x: 1.0
 space_y: 1.0
 space_z: 1.0
-roi_x: 96
-roi_y: 96
-roi_z: 96
-num_samples: 10
+roi_x: 128
+roi_y: 128
+roi_z: 128
+num_samples: 4
 phase: train
-uniform_sample: True
-datasetkey: ['10_03']
-cache_dataset: True
-cache_rate: 1.0
+persistent_cache: True
+persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModel

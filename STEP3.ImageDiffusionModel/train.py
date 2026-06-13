@@ -7,6 +7,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 import os
 from ddpm.unet import UNet
+import time
 from dataset.dataloader import get_loader
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)
@@ -20,9 +21,9 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
-            channels=2, # image (1) and tumor mask (1)
+            channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
             out_dim=cfg.model.out_dim,
-            num_continuous_conditioners=9,
+            num_continuous_conditioners=10,
             num_organs=9
         ).cuda()
     else:
@@ -39,6 +40,7 @@ def run(cfg: DictConfig):
     ).cuda()
 
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
+
     val_dataloader=None
 
     trainer = Trainer(

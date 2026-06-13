@@ -3,14 +3,14 @@ import argparse
 import numpy as np
 import pickle as pkl
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
 from vq_gan_3d.utils import shift_dim, adopt_weight, comp_getattr
-from vq_gan_3d.model.lpips import LPIPS
+from monai.losses import PerceptualLoss
 from vq_gan_3d.model.codebook import Codebook
 
 
@@ -43,8 +43,10 @@ def vanilla_d_loss(logits_real, logits_fake):
 class VQGAN(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
+
         self.cfg = cfg
         self.embedding_dim = cfg.model.embedding_dim
+        self.automatic_optimization = False
         self.n_codes = cfg.model.n_codes
 
         self.encoder = Encoder(cfg.model.n_hiddens, cfg.model.downsample,
@@ -73,7 +75,16 @@ class VQGAN(pl.LightningModule):
         elif cfg.model.disc_loss_type == 'hinge':
             self.disc_loss = hinge_d_loss
 
-        self.perceptual_model = LPIPS().eval()
+        self.perceptual_loss_fn = PerceptualLoss(
+            spatial_dims=3,
+            network_type="medicalnet_resnet10_23datasets",
+            is_fake_3d=False,
+            pretrained=True,
+            pretrained_path="/home/rpinise1/.cache/torch/hub/medicalnet/resnet_10_23dataset.pth",
+            pretrained_state_dict_key="state_dict",
+        ).eval()
+        for param in self.perceptual_loss_fn.parameters():
+            param.requires_grad = False
 
         self.image_gan_weight = cfg.model.image_gan_weight
         self.video_gan_weight = cfg.model.video_gan_weight
@@ -82,6 +93,12 @@ class VQGAN(pl.LightningModule):
 
         self.l1_weight = cfg.model.l1_weight
         self.save_hyperparameters()
+
+    def on_fit_start(self):
+        if (self.cfg.model.gpus > 0):
+            print("world_size:", self.trainer.world_size)
+            print("global_rank:", self.trainer.global_rank)
+            print("local_rank:", self.trainer.local_rank)
 
     def encode(self, x, include_embeddings=False, quantize=True):
         h = self.pre_vq_conv(self.encoder(x))
@@ -101,100 +118,90 @@ class VQGAN(pl.LightningModule):
         h = self.post_vq_conv(shift_dim(h, -1, 1))
         return self.decoder(h)
 
+
     def forward(self, x, optimizer_idx=None, log_image=False):
         B, C, D, H, W = x.shape
         z = self.pre_vq_conv(self.encoder(x))
+        z = F.normalize(z, p=2, dim=1)
         vq_output = self.codebook(z)
         x_recon = self.decoder(self.post_vq_conv(vq_output['embeddings']))
         recon_loss = F.l1_loss(x_recon, x) * self.l1_weight
 
-        # Selects one random 2D image from each 3D Image
-        frame_idx_T = torch.randint(0, D, [B]).cuda()
-        frame_idx_selected_T = frame_idx_T.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
+        # Random axial slice for 2D image discriminator
+        frame_idx_T = torch.randint(0, D, [B], device=x.device)
+        frame_idx_selected_T = frame_idx_T.reshape(
+            -1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
         frames_T = torch.gather(x, 2, frame_idx_selected_T).squeeze(2)
         frames_recon_T = torch.gather(x_recon, 2, frame_idx_selected_T).squeeze(2)
-
-        frame_idx_H = torch.randint(0, H, [B]).cuda()
-        frame_idx_selected_H = frame_idx_H.reshape(-1, 1, 1, 1, 1).repeat(1, C, D, 1, W)
-        frames_H = torch.gather(x, 3, frame_idx_selected_H).squeeze(3)
-        frames_recon_H = torch.gather(x_recon, 3, frame_idx_selected_H).squeeze(3)
-
-        frame_idx_W = torch.randint(0, W, [B]).cuda()
-        frame_idx_selected_W = frame_idx_W.reshape(-1, 1, 1, 1, 1).repeat(1, C, D, H, 1)
-        frames_W = torch.gather(x, 4, frame_idx_selected_W).squeeze(4)
-        frames_recon_W = torch.gather(x_recon, 4, frame_idx_selected_W).squeeze(4)
 
         if log_image:
             return frames_T, frames_recon_T, x, x_recon
 
         if optimizer_idx == 0:
-            # Autoencoder - train the "generator"
-
-            # Perceptual loss
+            # Perceptual loss — 3D volume, (fake, real) order for MONAI
             perceptual_loss = 0
             if self.perceptual_weight > 0:
-                perceptual_loss = (self.perceptual_model(frames_T, frames_recon_T).mean()+
-                                   self.perceptual_model(frames_H, frames_recon_H).mean()+
-                                   self.perceptual_model(frames_W, frames_recon_W).mean()) * self.perceptual_weight
+                perceptual_loss = self.perceptual_loss_fn(
+                    x_recon.float(), x.float()  # (input/fake, target/real)
+                ) * self.perceptual_weight
 
-            # Discriminator loss (turned on after a certain epoch)
+            # GAN loss
             logits_image_fake, pred_image_fake = self.image_discriminator(
                 frames_recon_T)
-            logits_video_fake, pred_video_fake = self.video_discriminator(
-                x_recon)
+            logits_video_fake, pred_video_fake = self.video_discriminator(x_recon)
             g_image_loss = -torch.mean(logits_image_fake)
             g_video_loss = -torch.mean(logits_video_fake)
-            g_loss = self.image_gan_weight*g_image_loss + self.video_gan_weight*g_video_loss
+            g_loss = self.image_gan_weight * g_image_loss + \
+                self.video_gan_weight * g_video_loss
             disc_factor = adopt_weight(
-                self.global_step, threshold=self.cfg.model.discriminator_iter_start)
+                self.global_step, threshold=self.cfg.model.discriminator_iter_start
+            ) * 0.1
             aeloss = disc_factor * g_loss
 
-            # GAN feature matching loss - tune features such that we get the same prediction result on the discriminator
+            # GAN feature matching loss
             image_gan_feat_loss = 0
             video_gan_feat_loss = 0
             feat_weights = 4.0 / (3 + 1)
             if self.image_gan_weight > 0:
                 logits_image_real, pred_image_real = self.image_discriminator(
                     frames_T)
-                for i in range(len(pred_image_fake)-1):
-                    image_gan_feat_loss += feat_weights * \
-                        F.l1_loss(pred_image_fake[i], pred_image_real[i].detach(
-                        )) * (self.image_gan_weight > 0)
+                for i in range(len(pred_image_fake) - 1):
+                    image_gan_feat_loss += feat_weights * F.l1_loss(
+                        pred_image_fake[i], pred_image_real[i].detach()
+                    )
             if self.video_gan_weight > 0:
-                logits_video_real, pred_video_real = self.video_discriminator(
-                    x)
-                for i in range(len(pred_video_fake)-1):
-                    video_gan_feat_loss += feat_weights * \
-                        F.l1_loss(pred_video_fake[i], pred_video_real[i].detach(
-                        )) * (self.video_gan_weight > 0)
-            gan_feat_loss = disc_factor * self.gan_feat_weight * \
-                (image_gan_feat_loss + video_gan_feat_loss)
+                logits_video_real, pred_video_real = self.video_discriminator(x)
+                for i in range(len(pred_video_fake) - 1):
+                    video_gan_feat_loss += feat_weights * F.l1_loss(
+                        pred_video_fake[i], pred_video_real[i].detach()
+                    )
+            gan_feat_loss = disc_factor * self.gan_feat_weight * (
+                image_gan_feat_loss + video_gan_feat_loss
+            )
 
             self.log("train/g_image_loss", g_image_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/g_video_loss", g_video_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/image_gan_feat_loss", image_gan_feat_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/video_gan_feat_loss", video_gan_feat_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/perceptual_loss", perceptual_loss,
-                     prog_bar=True, logger=True, on_step=True, on_epoch=True)
+                    prog_bar=True, logger=True, on_step=True, on_epoch=True)
             self.log("train/recon_loss", recon_loss, prog_bar=True,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/aeloss", aeloss, prog_bar=True,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/commitment_loss", vq_output['commitment_loss'],
-                     prog_bar=True, logger=True, on_step=True, on_epoch=True)
+                    prog_bar=True, logger=True, on_step=True, on_epoch=True)
             self.log('train/perplexity', vq_output['perplexity'],
-                     prog_bar=True, logger=True, on_step=True, on_epoch=True)
+                    prog_bar=True, logger=True, on_step=True, on_epoch=True)
             return recon_loss, x_recon, vq_output, aeloss, perceptual_loss, gan_feat_loss
 
         if optimizer_idx == 1:
-            # Train discriminator
             logits_image_real, _ = self.image_discriminator(frames_T.detach())
             logits_video_real, _ = self.video_discriminator(x.detach())
-
             logits_image_fake, _ = self.image_discriminator(
                 frames_recon_T.detach())
             logits_video_fake, _ = self.video_discriminator(x_recon.detach())
@@ -202,51 +209,133 @@ class VQGAN(pl.LightningModule):
             d_image_loss = self.disc_loss(logits_image_real, logits_image_fake)
             d_video_loss = self.disc_loss(logits_video_real, logits_video_fake)
             disc_factor = adopt_weight(
-                self.global_step, threshold=self.cfg.model.discriminator_iter_start)
-            discloss = disc_factor * \
-                (self.image_gan_weight*d_image_loss +
-                 self.video_gan_weight*d_video_loss)
+                self.global_step, threshold=self.cfg.model.discriminator_iter_start
+            )
+            discloss = disc_factor * (
+                self.image_gan_weight * d_image_loss +
+                self.video_gan_weight * d_video_loss
+            )
 
             self.log("train/logits_image_real", logits_image_real.mean().detach(),
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/logits_image_fake", logits_image_fake.mean().detach(),
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/logits_video_real", logits_video_real.mean().detach(),
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/logits_video_fake", logits_video_fake.mean().detach(),
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/d_image_loss", d_image_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/d_video_loss", d_video_loss,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             self.log("train/discloss", discloss, prog_bar=True,
-                     logger=True, on_step=True, on_epoch=True)
+                    logger=True, on_step=True, on_epoch=True)
             return discloss
 
-        # perceptual_loss = self.perceptual_model(
-        #     frames, frames_recon) * self.perceptual_weight
-        perceptual_loss = (self.perceptual_model(frames_T, frames_recon_T).mean()+
-                                   self.perceptual_model(frames_H, frames_recon_H).mean()+
-                                   self.perceptual_model(frames_W, frames_recon_W).mean()) * self.perceptual_weight
+        # Fallback / validation path
+        perceptual_loss = 0
+        if self.perceptual_weight > 0:
+            perceptual_loss = self.perceptual_loss_fn(
+                x_recon.float(), x.float()
+            ) * self.perceptual_weight
         return recon_loss, x_recon, vq_output, perceptual_loss
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def set_requires_grad(self, nets, requires_grad=False):
+        """Helper to toggle gradient calculation for a list of networks."""
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad
+
+    def training_step(self, batch, batch_idx):
+        import time
+
+        # data is already loaded when training_step is called
+        t_data_done = time.perf_counter()
+
+        opt_ae, opt_disc = self.optimizers()
+        sch_ae, sch_disc = self.lr_schedulers()
+
         x = batch['image']
-        x = x.permute(0,1,-1,-3,-2).detach()
-        if optimizer_idx == 0:
-            recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(
-                x, optimizer_idx)
-            commitment_loss = vq_output['commitment_loss']
-            loss = recon_loss + commitment_loss + aeloss + perceptual_loss + gan_feat_loss
-        if optimizer_idx == 1:
-            discloss = self.forward(x, optimizer_idx)
-            loss = discloss
-        
-        return loss
+        x = x.as_tensor() if hasattr(x, 'as_tensor') else x
+        x = x.contiguous().permute(0, 1, -1, -3, -2).detach()
+
+        generator_nets = [self.encoder, self.decoder,
+                          self.pre_vq_conv, self.post_vq_conv, self.codebook]
+        discriminator_nets = [
+            self.image_discriminator, self.video_discriminator]
+
+        self.set_requires_grad(generator_nets, True)
+        self.set_requires_grad(discriminator_nets, False)
+
+        # Generator step
+        t_forward_start = time.perf_counter()
+        opt_ae.zero_grad()
+        recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(
+            x, 0)
+        commitment_loss = vq_output['commitment_loss']
+        loss_ae = recon_loss + commitment_loss + \
+            aeloss + perceptual_loss + gan_feat_loss
+        self.manual_backward(loss_ae)
+        self.clip_gradients(
+            opt_ae, gradient_clip_val=self.cfg.model.gradient_clip_val, gradient_clip_algorithm="norm")
+        opt_ae.step()
+
+        self.set_requires_grad(generator_nets, False)
+        self.set_requires_grad(discriminator_nets, True)
+
+        # Discriminator step
+        opt_disc.zero_grad()
+        discloss = self.forward(x, 1)
+        self.manual_backward(discloss)
+        self.clip_gradients(
+            opt_disc, gradient_clip_val=self.cfg.model.gradient_clip_val, gradient_clip_algorithm="norm")
+        opt_disc.step()
+        t_compute_done = time.perf_counter()
+
+        # Step schedulers manually (Lightning won't do it automatically)
+        sch_ae.step()
+        sch_disc.step()
+
+        # ── Timing Logging ──────────────────────────────────────────────
+        if not hasattr(self, '_timing'):
+            self._timing = {'data': [], 'compute': [], 'last_batch_end': None}
+
+        compute_ms = (t_compute_done - t_forward_start) * 1000
+
+        # Data time = gap between end of last step and when this batch arrived
+        if self._timing['last_batch_end'] is not None:
+            data_ms = (t_data_done - self._timing['last_batch_end']) * 1000
+            self._timing['data'].append(data_ms)
+
+        self._timing['compute'].append(compute_ms)
+        self._timing['last_batch_end'] = t_compute_done
+
+        if batch_idx % 10 == 0 and len(self._timing['data']) > 0:
+            avg_data = sum(self._timing['data'][-50:]) / \
+                len(self._timing['data'][-50:])
+            avg_compute = sum(
+                self._timing['compute'][-50:]) / len(self._timing['compute'][-50:])
+            efficiency = avg_compute / (avg_compute + avg_data) * 100
+
+            print(
+                f"[Step {batch_idx}] "
+                f"data={avg_data:.0f}ms | "
+                f"compute={avg_compute:.0f}ms | "
+                f"GPU efficiency={efficiency:.1f}% | "
+                f"loss_ae={loss_ae.item():.4f} | "
+                f"discloss={discloss.item():.4f}"
+            )
+
+            self.log('timing/data_ms',    avg_data,    on_step=True)
+            self.log('timing/compute_ms', avg_compute, on_step=True)
+            self.log('timing/efficiency', efficiency,  on_step=True)
 
     def validation_step(self, batch, batch_idx):
         x = batch['image']
-        x = x.permute(0,1,-1,-3,-2).detach()
+        x = x.permute(0, 1, -1, -3, -2).detach()
         recon_loss, _, vq_output, perceptual_loss = self.forward(x)
         self.log('val/recon_loss', recon_loss, prog_bar=True)
         self.log('val/perceptual_loss', perceptual_loss, prog_bar=True)
@@ -259,36 +348,28 @@ class VQGAN(pl.LightningModule):
         opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
                                   list(self.decoder.parameters()) +
                                   list(self.pre_vq_conv.parameters()) +
-                                  list(self.post_vq_conv.parameters()) +
-                                  list(self.codebook.parameters()),
+                                  list(self.post_vq_conv.parameters()),
                                   lr=lr, betas=(0.5, 0.9))
         opt_disc = torch.optim.Adam(list(self.image_discriminator.parameters()) +
                                     list(self.video_discriminator.parameters()),
                                     lr=lr, betas=(0.5, 0.9))
-        
-        scheduler_ae = {
-                'scheduler': torch.optim.lr_scheduler.MultiStepLR(opt_ae, milestones=[40000,50000,60000], gamma=0.1),
-                'interval': 'step',
-                'frequency': 1
-            }
-        scheduler_disc = {
-                'scheduler': torch.optim.lr_scheduler.MultiStepLR(opt_disc, milestones=[40000,50000,60000], gamma=0.1),
-                'interval': 'step',
-                'frequency': 1
-            }
+
+        scheduler_ae = torch.optim.lr_scheduler.MultiStepLR(
+            opt_ae, milestones=[40000, 50000, 60000], gamma=0.1)
+        scheduler_disc = torch.optim.lr_scheduler.MultiStepLR(
+            opt_disc, milestones=[40000, 50000, 60000], gamma=0.1)
+
         return [opt_ae, opt_disc], [scheduler_ae, scheduler_disc]
-    
 
     def log_images(self, batch, **kwargs):
         log = dict()
         x = batch['image']
-        x = x.permute(0,1,-1,-3,-2).detach()
+        x = x.permute(0, 1, -1, -3, -2).detach()
         x = x.to(self.device)
         frames, frames_rec, _, _ = self(x, log_image=True)
         log["inputs"] = frames
         log["reconstructions"] = frames_rec
         return log
-
 
 
 def Normalize(in_channels, norm_type='group', num_groups=32):
@@ -375,7 +456,7 @@ class Decoder(nn.Module):
             h = block.res1(h)
             h = block.res2(h)
         h = self.conv_last(h)
-        return h
+        return torch.tanh(h)
 
 
 class ResBlock(nn.Module):
