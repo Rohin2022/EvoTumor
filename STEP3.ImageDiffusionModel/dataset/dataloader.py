@@ -182,7 +182,6 @@ def get_loader(args):
             CombineMasksToTernaryd(
                 organ_key="organ_mask", tumor_key="tumor_mask", output_key="label"),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
-            CropForegroundd(keys=["image", "label"], source_key="label"),
             Spacingd(
                 keys=["image", "label"],
                 pixdim=(args.space_x, args.space_y, args.space_z),
@@ -416,7 +415,7 @@ def get_loader(args):
                 data_dicts_train_final.append(record)
 
         del data_dicts_train
-        # data_dicts_train_final = data_dicts_train_final[:10] # TO REMOVE
+        #data_dicts_train_final = data_dicts_train_final[:10] # TO REMOVE
 
         print('train len {}'.format(len(data_dicts_train_final)))
 

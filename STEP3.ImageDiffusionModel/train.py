@@ -60,7 +60,7 @@ def run(cfg: DictConfig):
     )
 
     if cfg.model.load_milestone:
-        trainer.load(cfg.model.load_milestone)
+        trainer.load(-1) # load the latest checkpoint
 
     trainer.train()
 

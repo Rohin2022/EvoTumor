@@ -11,11 +11,11 @@ tumor_datafile: tumor_metrics_v1.csv
 tumor_masks_datafile: RadiomicsMaskMetricsBadDropped_Train.csv
 
 dist: False
-batch_size: 8
+batch_size: 4
 num_workers: 16
 
 a_min: -1000
-a_max: 1000
+a_max: 500
 b_min: -1.0
 b_max: 1.0
 space_x: 1.0
@@ -24,7 +24,7 @@ space_z: 1.0
 roi_x: 128
 roi_y: 128
 roi_z: 128
-num_samples: 4
+num_samples: 3
 phase: train
 persistent_cache: True
 persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModel

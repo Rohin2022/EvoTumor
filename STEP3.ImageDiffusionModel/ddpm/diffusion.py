@@ -733,9 +733,9 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1.):
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale))
+            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -757,10 +757,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -776,7 +776,7 @@ class GaussianDiffusion(nn.Module):
         print('cond', cond.shape)
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond, cond_scale=cond_scale)
 
         return img
 
@@ -880,6 +880,7 @@ class GaussianDiffusion(nn.Module):
                 img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
                 masked_img = ((masked_img - emb_min) / emb_denom) * 2.0 - 1.0
         else:
+            raise RuntimeError("PLEASE USE VQGAN")
             # Wrap in no_grad to prevent tracking gradients on detached tensors
             with torch.no_grad():
                 img = normalize_img(img)
@@ -996,11 +997,18 @@ class Trainer(object):
 
     def load(self, milestone, map_location=None, **kwargs):
         if milestone == -1:
-            all_milestones = [int(p.stem.split('-')[-1])
-                              for p in Path(self.results_folder).glob('**/*.pt')]
-            assert len(
-                all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
+            all_milestones = [
+                int(p.stem)
+                for p in Path(self.results_folder).glob('*.pt')
+                if p.stem.isdigit()
+            ]
+            assert len(all_milestones) > 0, \
+                'need to have at least one numeric milestone to load from latest checkpoint (milestone == -1)'
             milestone = max(all_milestones)
+
+        # if milestone is an integer like 5, convert it to checkpoints/5.pt
+        if isinstance(milestone, int):
+            milestone = str(Path(self.results_folder) / f'{milestone}.pt')
 
         if map_location:
             data = torch.load(milestone, map_location=map_location)
@@ -1113,6 +1121,103 @@ class Trainer(object):
                     self.save('model_best')
                     print(f'New best model found at step {self.step}')
                     
+            # =======================================================
+            # Periodic Inference (Runs every 1000 steps)
+            # =======================================================
+            if self.step % 1000 == 0:
+                print(f"\n--- Running inference at step {self.step} ---")
+                self.model.eval() # Switch to eval mode for inference
+                
+                with torch.no_grad():
+                    vqgan = self.model.vqgan
+                    batch_size = image.shape[0]
+                    cond_scale = 3.0 # Default CFG scale from your script
+                    
+                    # 1. Build Spatial Conditioning for Diffusion
+                    mask_bg = (1 - mask).detach()
+                    masked_img = (image * mask_bg).detach()
+                    
+                    masked_img_p = masked_img.permute(0, 1, 4, 2, 3)
+                    mask_p = mask.permute(0, 1, 4, 2, 3)
+                    
+                    emb_min = vqgan.codebook.embeddings.min()
+                    emb_max = vqgan.codebook.embeddings.max()
+                    emb_denom = emb_max - emb_min
+                    
+                    latent = vqgan.encode(masked_img_p, quantize=False, include_embeddings=True)
+                    latent_n = ((latent - emb_min) / emb_denom) * 2.0 - 1.0
+                    
+                    cc = F.interpolate(
+                        mask_p * 2.0 - 1.0, 
+                        size=latent_n.shape[-3:], 
+                        mode='trilinear', 
+                        align_corners=False
+                    )
+                    spatial_cond = torch.cat([latent_n, cc], dim=1)
+                    latent_shape = latent_n.shape
+                    
+                    # 2. Reverse Diffusion in Latent Space
+                    noisy_latent = torch.randn(latent_shape, device=self.device)
+                    
+                    for i in tqdm(reversed(range(self.model.num_timesteps)), desc=f"Sampling cfg={cond_scale}", leave=False):
+                        t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+                        noisy_latent = self.model.p_sample(
+                            noisy_latent, t,
+                            cond=spatial_cond,
+                            tabular_cond=tabular_cond,
+                            cond_scale=cond_scale
+                        )
+                        
+                    # 3. Decode Diffusion Latent to CT
+                    latent_denorm = ((noisy_latent + 1.0) / 2.0) * emb_denom + emb_min
+                    decoded = vqgan.decode(latent_denorm, quantize=True)
+                    ct_synth = decoded.permute(0, 1, 3, 4, 2).contiguous()
+
+                    # ---------------------------------------------------
+                    # NEW: VQGAN Autoencode (Original Image In & Out)
+                    # ---------------------------------------------------
+                    image_p = image.permute(0, 1, 4, 2, 3) # Permute to VQGAN shape
+                    latent_orig = vqgan.encode(image_p, quantize=False, include_embeddings=True)
+                    decoded_orig = vqgan.decode(latent_orig, quantize=True)
+                    ct_vqgan_recon = decoded_orig.permute(0, 1, 3, 4, 2).contiguous()
+                    
+                    # 4. Save NIfTI outputs
+                    import nibabel as nib
+                    import numpy as np
+                    
+                    debug_folder = self.results_folder / 'debug_masks' 
+                    debug_folder.mkdir(exist_ok=True)
+                    spacing = (1.0, 1.0, 1.0)
+                    affine = np.diag([*spacing, 1.0])
+                    
+                    # Move tensors to CPU and convert to NumPy
+                    ct_np = ct_synth.cpu().numpy()
+                    mask_np = mask.cpu().numpy()
+                    orig_ct_np = image.cpu().numpy()
+                    vqgan_recon_np = ct_vqgan_recon.cpu().numpy()
+                    
+                    for b in range(min(3,batch_size)):
+                        # Extract 3D volumes
+                        ct_3d = ct_np[b, 0]
+                        mask_3d = mask_np[b, 0]
+                        orig_3d = orig_ct_np[b, 0]
+                        vqgan_3d = vqgan_recon_np[b, 0]
+                        
+                        stem = f"step{self.step:04d}_b{b}"
+                        
+                        # Save Diffusion Output & Mask
+                        nib.save(nib.Nifti1Image(ct_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_cfg{cond_scale}_diffusion_ct.nii.gz"))
+                        nib.save(nib.Nifti1Image(mask_3d.astype(np.uint8), affine), str(debug_folder / f"{stem}_mask.nii.gz"))
+                        
+                        # Save Original & VQGAN Reconstruction
+                        nib.save(nib.Nifti1Image(orig_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_original_ct.nii.gz"))
+                        #nib.save(nib.Nifti1Image(vqgan_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_vqgan_recon_ct.nii.gz"))
+                        
+                self.model.train() # Switch back to training mode
+                print("--- Inference complete, resuming training ---\n")
+            # =======================================================
+
+            
             log_fn(log)
             self.step += 1
 
