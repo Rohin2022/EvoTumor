@@ -1,0 +1,48 @@
+# =============================================================================
+# dataset.yaml
+# Paths, manifest location, and intensity windowing for the longitudinal
+# CT tumor-synthesis producer (longitudinal_producer.py).
+# =============================================================================
+
+# Kept from the original config for reference / other tooling that may key
+# off these; not directly read by longitudinal_producer.py.
+dataset_list: 'abdomen_atlas_pro'
+
+# Root containing <bdmap_id>/ct.nii.gz for every case (both ct0 and ct1 ids
+# must resolve under this same root).
+data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+
+# Root containing <bdmap_id>/segmentations/<organ>_lesion.nii.gz
+# (tumor / lesion masks, per radiologist annotation).
+segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer/
+
+# Root containing <bdmap_id>/segmentations/<organ>.nii.gz
+# (whole-organ segmentation masks).
+organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+
+# Directory + filename of the CSV manifest of longitudinal pairs:
+#   ct0_bdmap, ct1_bdmap, ct0_t, ct1_t, time_delta_readable,
+#   unix_delta, normalized_time_delta, organ
+data_txt_path: cross_eval/
+datafile: Datapairs_with_masks.csv
+
+# -----------------------------------------------------------------------------
+# CT intensity windowing (applied to both ct0 and the warped ct1 image
+# before cropping/encoding). a_min/a_max are the HU clamp window;
+# b_min/b_max are the rescaled output range.
+# -----------------------------------------------------------------------------
+a_min: -1000      # HU lower clamp bound -- fill in to match your VQGAN's training window
+a_max: 500     # HU upper clamp bound -- fill in to match your VQGAN's training window
+b_min: -1.0      # rescaled output lower bound
+b_max: 1.0       # rescaled output upper bound
+
+# -----------------------------------------------------------------------------
+# Crop size (passed to RandCropByLabelClassesd as spatial_size).
+# -----------------------------------------------------------------------------
+roi_x: 128
+roi_y: 128
+roi_z: 128
+
+space_x: 1
+space_y: 1
+space_z: 1

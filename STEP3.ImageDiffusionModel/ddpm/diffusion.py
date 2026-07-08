@@ -205,11 +205,20 @@ class Block(nn.Module):
 
 
 class ResnetBlock(nn.Module):
+    """
+    FiLM-conditioned ResNet block. time_emb here is the FUSED conditioning
+    vector (diffusion timestep concat delta-t embedding), not just timestep.
+
+    Fix vs. original: the MLP now outputs dim_out * 4, giving an independent
+    (scale, shift) pair for block1 AND block2. The original only conditioned
+    block1, so block2 saw an un-modulated residual path -- effectively half
+    the network was blind to conditioning.
+    """
     def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
+            nn.Linear(time_emb_dim, dim_out * 4)
         ) if exists(time_emb_dim) else None
 
         self.block1 = Block(dim, dim_out, groups=groups)
@@ -219,18 +228,20 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x, time_emb=None):
 
-        scale_shift = None
+        scale_shift_1 = None
+        scale_shift_2 = None
         if exists(self.mlp):
             assert exists(time_emb), 'time emb must be passed in'
             time_emb = self.mlp(time_emb)
             time_emb = rearrange(time_emb, 'b c -> b c 1 1 1')
-            scale_shift = time_emb.chunk(2, dim=1)
+            # split into two independent FiLM pairs, one per block
+            scale1, shift1, scale2, shift2 = time_emb.chunk(4, dim=1)
+            scale_shift_1 = (scale1, shift1)
+            scale_shift_2 = (scale2, shift2)
 
-        h = self.block1(x, scale_shift=scale_shift)
-
-        h = self.block2(h)
+        h = self.block1(x, scale_shift=scale_shift_1)
+        h = self.block2(h, scale_shift=scale_shift_2)
         return h + self.res_conv(x)
-
 
 class SpatialLinearAttention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
@@ -364,7 +375,6 @@ class Attention(nn.Module):
 
 # model
 
-
 class Unet3D(nn.Module):
     def __init__(
         self,
@@ -372,7 +382,7 @@ class Unet3D(nn.Module):
         cond_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        channels=129,
+        channels=17,
         attn_heads=8,
         attn_dim_head=32,
         use_bert_text_cond=False,
@@ -381,8 +391,7 @@ class Unet3D(nn.Module):
         use_sparse_linear_attn=True,
         block_type='resnet',
         resnet_groups=8,
-        num_organs = 9,
-        num_continuous_conditioners=10
+        delta_t_max=800.0,   # normalization scale for delta_t (e.g. max days in dataset)
     ):
         super().__init__()
         self.channels = channels
@@ -394,7 +403,6 @@ class Unet3D(nn.Module):
         def temporal_attn(dim): return EinopsToAndFrom('b c f h w', 'b (h w) f c', Attention(
             dim, heads=attn_heads, dim_head=attn_dim_head, rotary_emb=rotary_emb))
 
-        # realistically will not be able to generate that many frames of video... yet
         self.time_rel_pos_bias = RelativePositionBias(
             heads=attn_heads, max_distance=32)
 
@@ -415,8 +423,7 @@ class Unet3D(nn.Module):
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        # time conditioning
-
+        # --- diffusion timestep embedding ---
         time_dim = dim * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
@@ -425,35 +432,29 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        self.num_organs = num_organs
-        # diameters, volumes, means, stds
-        self.num_continuous_conditioners = num_continuous_conditioners
+        # --- delta-t (clinical time gap) embedding ---
+        # separate Fourier/sinusoidal basis from the diffusion timestep,
+        # since these represent fundamentally different quantities and must
+        # not be allowed to collapse into a shared additive signal.
+        self.delta_t_pos_emb = SinusoidalPosEmb(dim)
+        self.delta_t_mlp = nn.Sequential(
+            nn.Linear(dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+        # learned null embedding for CFG dropout on delta_t
+        self.delta_t_null_emb = nn.Parameter(torch.randn(1, time_dim))
 
-        self.tabular_cond_dim = self.num_organs + self.num_continuous_conditioners
-
-        # Total input to the MLP is now: 9 (one-hot organ) + 10 (continuous) = 19
-        self.tabular_cond_mlp = nn.Sequential(
-            nn.Linear(self.tabular_cond_dim, time_dim),
+        # --- fusion: concat (not add) timestep emb + delta_t emb ---
+        # concatenation preserves each signal's own subspace; the fusion MLP
+        # then learns how to combine them, rather than one dominating/
+        # cancelling the other as happens with additive fusion.
+        self.cond_fusion_mlp = nn.Sequential(
+            nn.Linear(time_dim * 2, time_dim),
             nn.SiLU(),
             nn.LayerNorm(time_dim),
             nn.Linear(time_dim, time_dim)
         )
-
-        #nn.init.zeros_(self.cond_mlp[-1].weight)
-        #nn.init.zeros_(self.cond_mlp[-1].bias)
-
-
-        # text conditioning
-        '''
-        self.has_cond = exists(cond_dim) or use_bert_text_cond
-        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
-
-        
-
-        cond_dim = time_dim + int(cond_dim or 0)'''
-
-        self.tabular_null_cond_emb = nn.Parameter(
-            torch.randn(1, self.tabular_cond_dim))
 
         # layers
 
@@ -461,12 +462,9 @@ class Unet3D(nn.Module):
         self.ups = nn.ModuleList([])
 
         num_resolutions = len(in_out)
-        # block type
-
         block_klass = partial(ResnetBlock, groups=resnet_groups)
         block_klass_cond = partial(block_klass, time_emb_dim=time_dim)
 
-        # modules for all layers
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
@@ -516,9 +514,7 @@ class Unet3D(nn.Module):
         **kwargs
     ):
         logits = self.forward(*args, null_cond_prob=0., **kwargs)
-        if cond_scale == 1 or (
-            kwargs.get('cond') is None and kwargs.get('tabular_cond') is None
-        ):
+        if cond_scale == 1 or kwargs.get('cond') is None:
             return logits
 
         null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
@@ -528,12 +524,10 @@ class Unet3D(nn.Module):
         self,
         x,
         time,
+        time_delta,
         cond=None,
-        tabular_cond=None,
-        textual_cond_embed=None,
         null_cond_prob=0.10,
         focus_present_mask=None,
-        # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
         prob_focus_present=0.
     ):
 
@@ -542,8 +536,9 @@ class Unet3D(nn.Module):
         drop_mask = torch.rand(batch, device=device) < null_cond_prob
 
         if exists(cond):
-            spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
-            cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
+            # spatial conditioning (e.g. z0 baseline latent) stays at full
+            # strength -- it is the anchor for residual generation, not an
+            # optional style condition, so it is never CFG-dropped.
             x = torch.cat([x, cond], dim=1)
 
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
@@ -556,26 +551,28 @@ class Unet3D(nn.Module):
 
         x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
 
-        t = self.time_mlp(time)
+        # --- diffusion timestep embedding ---
+        t_emb = self.time_mlp(time)
 
-        # classifier free guidance
+        # --- delta_t embedding ---
+        delta_t_norm = time_delta.float().to(device)
+        delta_emb = self.delta_t_pos_emb(delta_t_norm)
+        delta_emb = self.delta_t_mlp(delta_emb)
 
-        if exists(tabular_cond):
-            emb_mask = drop_mask.view(batch, 1)
+        # CFG dropout on delta_t only (independent of spatial cond dropout)
+        emb_mask = drop_mask.view(batch, 1)
+        delta_emb = torch.where(
+            emb_mask.bool(),
+            self.delta_t_null_emb.expand(batch, -1),
+            delta_emb
+        )
 
-            # Replace input with null embedding BEFORE passing through MLP
-            tabular_cond = torch.where(
-                emb_mask.bool(),
-                self.tabular_null_cond_emb.expand(batch, -1),
-                tabular_cond
-            )
-
-            # Now project to time_dim space
-            tab_emb = self.tabular_cond_mlp(tabular_cond)
-            t = t + tab_emb
+        # --- fuse via concat, not addition ---
+        fused = torch.cat([t_emb, delta_emb], dim=-1)
+        t = self.cond_fusion_mlp(fused)
 
         h = []
-        
+
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
             x = block2(x, t)
@@ -585,7 +582,7 @@ class Unet3D(nn.Module):
             h.append(x)
             x = downsample(x)
 
-        x = self.mid_block1(x, t) 
+        x = self.mid_block1(x, t)
         x = self.mid_spatial_attn(x)
         x = self.mid_temporal_attn(
             x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
@@ -733,9 +730,9 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, time_delta, clip_denoised: bool, cond=None, textual_cond_embed=None, cond_scale=1.):
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale))
+            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, time_delta=time_delta, cond=cond, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -757,10 +754,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, time_delta, cond=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, time_delta=time_delta, cond=cond, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -768,7 +765,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1.):
+    def p_sample_loop(self, shape, time_delta, cond=None, cond_scale=1.):
         device = self.betas.device
 
         b = shape[0]
@@ -776,7 +773,7 @@ class GaussianDiffusion(nn.Module):
         print('cond', cond.shape)
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), time_delta=time_delta, cond=cond, cond_scale=cond_scale)
 
         return img
 
@@ -832,18 +829,13 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, tabular_cond=None, textual_cond=None, noise=None, null_cond_prob=0.10, **kwargs):
+    def p_losses(self, x_start, t, time_delta, cond=None, textual_cond=None, noise=None, null_cond_prob=0.10, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        textual_cond_embed = None
-        if exists(textual_cond):
-            textual_cond_embed = bert_embed(
-                tokenize(textual_cond), return_cls_repr=self.text_use_bert_cls)
-            textual_cond_embed = textual_cond_embed.to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed = textual_cond_embed, null_cond_prob=null_cond_prob, **kwargs)
+        x_recon = self.denoise_fn(x_noisy, t, time_delta, cond=cond, null_cond_prob=null_cond_prob, **kwargs)
 
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, x_recon)
@@ -854,49 +846,45 @@ class GaussianDiffusion(nn.Module):
 
         return loss
 
-    def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
+    def forward(self, ct0, ct1, mask, new_mask, time_delta, null_cond_prob=0.10, *args, **kwargs):
         # 1. Create masks and detached masked images
-        mask_ = (1 - mask).detach()
-        masked_img = (img * mask_).detach()
-        
-        # 2. Permute dimensions (Consider using explicit positive indices instead of -1, -3, -2)
-        masked_img = masked_img.permute(0, 1, -1, -3, -2)
-        img = img.permute(0, 1, -1, -3, -2)
+
         mask = mask.permute(0, 1, -1, -3, -2)
+        new_mask = new_mask.permute(0, 1, -1, -3, -2)
+        ct0 = ct0.permute(0, 1, -1, -3, -2)
+        ct1 = ct1.permute(0, 1, -1, -3, -2)
 
         # 3. Process through VQGAN or standard normalization safely
         if isinstance(self.vqgan, VQGAN):
             with torch.no_grad():
                 # Cache min/max to avoid recalculating 4 times
-                emb_min = self.vqgan.codebook.embeddings.min()
-                emb_max = self.vqgan.codebook.embeddings.max()
-                emb_denom = emb_max - emb_min
+                # emb_min = self.vqgan.codebook.embeddings.min()
+                # emb_max = self.vqgan.codebook.embeddings.max()
+                # emb_denom = emb_max - emb_min
 
-                # Encode
-                img = self.vqgan.encode(img, quantize=False, include_embeddings=True)
-                masked_img = self.vqgan.encode(masked_img, quantize=False, include_embeddings=True)
+                # Encode full ct0
+                z0 = self.vqgan.encode(ct0, quantize=False, include_embeddings=True)
+                z1 = self.vqgan.encode(ct1, quantize=False, include_embeddings=True)
+                residual = z1 - z0
                 
                 # Normalize
-                img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
-                masked_img = ((masked_img - emb_min) / emb_denom) * 2.0 - 1.0
+                residual = residual * 1.7951
         else:
             raise RuntimeError("PLEASE USE VQGAN")
-            # Wrap in no_grad to prevent tracking gradients on detached tensors
-            with torch.no_grad():
-                img = normalize_img(img)
-                masked_img = normalize_img(masked_img)
             
         # 4. Condition preparation
         mask = mask * 2.0 - 1.0
-        cc = torch.nn.functional.interpolate(mask, size=masked_img.shape[-3:])
-        cond = torch.cat((masked_img, cc), dim=1)
+        new_mask = new_mask * 2.0 - 1.0
+        union_mask_reshaped = torch.nn.functional.interpolate(mask, size=residual.shape[-3:])
+        new_mask_reshaped = torch.nn.functional.interpolate(new_mask, size=residual.shape[-3:])
+        cond = torch.cat((z0, union_mask_reshaped, new_mask_reshaped), dim=1)
 
         # 5. Timestep sampling and loss calculation
-        b, device = img.shape[0], img.device
+        b, device = residual.shape[0], residual.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         
         return self.p_losses(
-            img, t, cond=cond, tabular_cond=tabular_cond, 
+            residual, t, time_delta, cond=cond, 
             null_cond_prob=null_cond_prob, *args, **kwargs
         )
 
@@ -1020,40 +1008,6 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'], **kwargs)
         self.scaler.load_state_dict(data['scaler'])
 
-    def prepare_conditional_vector(self, data, device):
-        """
-        Extracts tabular features into a single tensor, one-hot encoding the organ.
-        Output shape: (Batch, 18) -> 9 organ classes + 9 numerical features
-        """
-        numerical_features = [
-            "attenuation_mean", "attenuation_stdev", "attenuation_delta", # attenuation_delta is (mean_tumor - mean_organ) / std_organ
-            "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-            "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components"
-        ]
-
-        # 1. Handle the categorical "organ" feature
-        organ_idx = torch.as_tensor(
-            data["organ"], dtype=torch.long, device=device).view(-1)
-
-        # One-hot encode to shape (Batch, 9) and cast back to float32
-        organ_one_hot = F.one_hot(organ_idx, num_classes=9).float()
-
-        # 2. Handle the remaining continuous numerical features
-        num_tensors = []
-        for key in numerical_features:
-            val = torch.as_tensor(
-                data[key], dtype=torch.float32, device=device).view(-1)
-            num_tensors.append(val)
-
-        # Stack continuous features to shape (Batch, 10)
-        continuous_vector = torch.stack(num_tensors, dim=1)
-
-        # 3. Concatenate the one-hot organ with the continuous features
-        # Resulting shape: (Batch, 18)
-        cond_vector = torch.cat([organ_one_hot, continuous_vector], dim=1)
-
-        return cond_vector
-
 
     def train(
         self,
@@ -1067,19 +1021,24 @@ class Trainer(object):
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl)
                 
-                image = data['image'].to(self.device)
-                mask = data['label'].to(self.device)
+                ct0 = data['ct0'].to(self.device)
+                ct1 = data['ct1'].to(self.device)
+                mask = data['tumor_mask_union'].to(self.device)
+
+                new_mask = data['tumor_mask_moving'].to(self.device)
+
+                time_delta = data['normalized_time_delta']
                 #mask[mask==1]=0
                 #mask[mask==2]=1
 
-                tabular_cond = self.prepare_conditional_vector(
-                    data, device=self.device)
 
                 with autocast(enabled=self.amp):
                     loss = self.model(
-                        image, 
+                        ct0,
+                        ct1, 
                         mask,
-                        tabular_cond,
+                        new_mask,
+                        time_delta,
                         textual_cond=None,
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
@@ -1126,94 +1085,114 @@ class Trainer(object):
             # =======================================================
             if self.step % 1000 == 0:
                 print(f"\n--- Running inference at step {self.step} ---")
-                self.model.eval() # Switch to eval mode for inference
-                
+                self.model.eval()
+
                 with torch.no_grad():
                     vqgan = self.model.vqgan
-                    batch_size = image.shape[0]
-                    cond_scale = 3.0 # Default CFG scale from your script
-                    
-                    # 1. Build Spatial Conditioning for Diffusion
-                    mask_bg = (1 - mask).detach()
-                    masked_img = (image * mask_bg).detach()
-                    
-                    masked_img_p = masked_img.permute(0, 1, 4, 2, 3)
-                    mask_p = mask.permute(0, 1, 4, 2, 3)
-                    
+                    batch_size = ct0.shape[0]
+                    cond_scale = 3.0
+
+                    # 1. Encode baseline (z0) and ground-truth follow-up (z1) latents
+                    ct0_p = ct0.permute(0, 1, 4, 2, 3)
+                    ct1_p = ct1.permute(0, 1, 4, 2, 3)
+
                     emb_min = vqgan.codebook.embeddings.min()
                     emb_max = vqgan.codebook.embeddings.max()
                     emb_denom = emb_max - emb_min
-                    
-                    latent = vqgan.encode(masked_img_p, quantize=False, include_embeddings=True)
-                    latent_n = ((latent - emb_min) / emb_denom) * 2.0 - 1.0
-                    
-                    cc = F.interpolate(
-                        mask_p * 2.0 - 1.0, 
-                        size=latent_n.shape[-3:], 
-                        mode='trilinear', 
-                        align_corners=False
+
+                    z0 = vqgan.encode(ct0_p, quantize=False, include_embeddings=True)
+                    z0_n = ((z0 - emb_min) / emb_denom) * 2.0 - 1.0
+
+                    z1_gt = vqgan.encode(ct1_p, quantize=False, include_embeddings=True)
+                    z1_gt_n = ((z1_gt - emb_min) / emb_denom) * 2.0 - 1.0
+
+                    # 2. New tumor mask (target timepoint) as spatial conditioning,
+                    #    resized into latent space alongside z0
+                    mask_p = mask.permute(0, 1, 4, 2, 3)
+                    new_mask_p = new_mask.permute(0, 1, 4, 2, 3)
+                    mask_latent = F.interpolate(
+                        mask_p * 2.0 - 1.0,
+                        size=z0_n.shape[-3:],
+                        mode='nearest'  # use nearest, not trilinear -- matches training-time mask handling
                     )
-                    spatial_cond = torch.cat([latent_n, cc], dim=1)
-                    latent_shape = latent_n.shape
-                    
-                    # 2. Reverse Diffusion in Latent Space
-                    noisy_latent = torch.randn(latent_shape, device=self.device)
-                    
+
+                    new_mask_latent = F.interpolate(
+                        mask_p * 2.0 - 1.0,
+                        size=z0_n.shape[-3:],
+                        mode='nearest'  # use nearest, not trilinear -- matches training-time mask handling
+                    )
+                    spatial_cond = torch.cat([z0_n, mask_latent, new_mask_latent], dim=1)
+                    latent_shape = z0_n.shape
+
+                    # 3. Reverse diffusion to generate the RESIDUAL (not z1 directly)
+                    noisy_residual = torch.randn(latent_shape, device=self.device)
+
                     for i in tqdm(reversed(range(self.model.num_timesteps)), desc=f"Sampling cfg={cond_scale}", leave=False):
                         t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-                        noisy_latent = self.model.p_sample(
-                            noisy_latent, t,
+                        noisy_residual = self.model.p_sample(
+                            noisy_residual, t,
+                            time_delta=time_delta,
                             cond=spatial_cond,
-                            tabular_cond=tabular_cond,
                             cond_scale=cond_scale
                         )
-                        
-                    # 3. Decode Diffusion Latent to CT
-                    latent_denorm = ((noisy_latent + 1.0) / 2.0) * emb_denom + emb_min
-                    decoded = vqgan.decode(latent_denorm, quantize=True)
-                    ct_synth = decoded.permute(0, 1, 3, 4, 2).contiguous()
 
-                    # ---------------------------------------------------
-                    # NEW: VQGAN Autoencode (Original Image In & Out)
-                    # ---------------------------------------------------
-                    image_p = image.permute(0, 1, 4, 2, 3) # Permute to VQGAN shape
-                    latent_orig = vqgan.encode(image_p, quantize=False, include_embeddings=True)
-                    decoded_orig = vqgan.decode(latent_orig, quantize=True)
-                    ct_vqgan_recon = decoded_orig.permute(0, 1, 3, 4, 2).contiguous()
-                    
-                    # 4. Save NIfTI outputs
+                    residual_pred = noisy_residual  # generated Δz in latent space
+
+                    # 4. Extrapolate: z1_pred = z0 + residual
+                    z1_pred_n = z0_n + residual_pred
+
+                    # 5. Decode all three: residual (visualized as delta), z1_pred, z1_gt
+                    residual_denorm = residual_pred * (emb_denom / 2.0)  # undo the *2-1 scaling factor only (no shift, it's a delta)
+
+                    z1_pred_denorm = ((z1_pred_n + 1.0) / 2.0) * emb_denom + emb_min
+                    z1_gt_denorm = ((z1_gt_n + 1.0) / 2.0) * emb_denom + emb_min
+
+                    decoded_z1_pred = vqgan.decode(z1_pred_denorm, quantize=True)
+                    decoded_z1_gt = vqgan.decode(z1_gt_denorm, quantize=True)
+
+                    ct1_pred = decoded_z1_pred.permute(0, 1, 3, 4, 2).contiguous()
+                    ct1_gt_recon = decoded_z1_gt.permute(0, 1, 3, 4, 2).contiguous()
+
+                    # 6. Save NIfTI outputs
                     import nibabel as nib
                     import numpy as np
-                    
-                    debug_folder = self.results_folder / 'debug_masks' 
+
+                    debug_folder = self.results_folder / 'debug_masks'
                     debug_folder.mkdir(exist_ok=True)
                     spacing = (1.0, 1.0, 1.0)
                     affine = np.diag([*spacing, 1.0])
-                    
-                    # Move tensors to CPU and convert to NumPy
-                    ct_np = ct_synth.cpu().numpy()
+
+                    residual_np = residual_pred.cpu().numpy()
+                    ct1_pred_np = ct1_pred.cpu().numpy()
+                    ct1_gt_np = ct1_gt_recon.cpu().numpy()
+                    ct0_np = ct0.cpu().numpy()
+                    ct1_np = ct1.cpu().numpy()
                     mask_np = mask.cpu().numpy()
-                    orig_ct_np = image.cpu().numpy()
-                    vqgan_recon_np = ct_vqgan_recon.cpu().numpy()
-                    
-                    for b in range(min(3,batch_size)):
-                        # Extract 3D volumes
-                        ct_3d = ct_np[b, 0]
-                        mask_3d = mask_np[b, 0]
-                        orig_3d = orig_ct_np[b, 0]
-                        vqgan_3d = vqgan_recon_np[b, 0]
-                        
+
+                    for b in range(min(3, batch_size)):
                         stem = f"step{self.step:04d}_b{b}"
-                        
-                        # Save Diffusion Output & Mask
-                        nib.save(nib.Nifti1Image(ct_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_cfg{cond_scale}_diffusion_ct.nii.gz"))
-                        nib.save(nib.Nifti1Image(mask_3d.astype(np.uint8), affine), str(debug_folder / f"{stem}_mask.nii.gz"))
-                        
-                        # Save Original & VQGAN Reconstruction
-                        nib.save(nib.Nifti1Image(orig_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_original_ct.nii.gz"))
-                        #nib.save(nib.Nifti1Image(vqgan_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_vqgan_recon_ct.nii.gz"))
-                        
-                self.model.train() # Switch back to training mode
+
+                        # Save raw predicted residual (latent space, channel 0 for viewability)
+                        nib.save(nib.Nifti1Image(residual_np[b, 0].astype(np.float32), affine),
+                                str(debug_folder / f"{stem}_residual_pred.nii.gz"))
+
+                        # z1 extrapolated (z0 + residual), decoded to image space
+                        nib.save(nib.Nifti1Image(ct1_pred_np[b, 0].astype(np.float32), affine),
+                                str(debug_folder / f"{stem}_cfg{cond_scale}_z1_pred.nii.gz"))
+
+                        # ground-truth z1, decoded (VQGAN reconstruction floor for fair comparison)
+                        nib.save(nib.Nifti1Image(ct1_gt_np[b, 0].astype(np.float32), affine),
+                                str(debug_folder / f"{stem}_z1_gt_recon.nii.gz"))
+
+                        # originals for reference
+                        nib.save(nib.Nifti1Image(ct0_np[b, 0].astype(np.float32), affine),
+                                str(debug_folder / f"{stem}_ct0_original.nii.gz"))
+                        nib.save(nib.Nifti1Image(ct1_np[b, 0].astype(np.float32), affine),
+                                str(debug_folder / f"{stem}_ct1_original.nii.gz"))
+                        nib.save(nib.Nifti1Image(mask_np[b, 0].astype(np.uint8), affine),
+                                str(debug_folder / f"{stem}_mask.nii.gz"))
+
+                self.model.train()
                 print("--- Inference complete, resuming training ---\n")
             # =======================================================
 

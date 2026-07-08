@@ -1,0 +1,44 @@
+# =============================================================================
+# producer.yaml
+# Registration, VQGAN, cropping, and batching settings for the
+# longitudinal CT tumor-synthesis producer (longitudinal_producer.py).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Registration (uniGradICON instance optimization)
+# -----------------------------------------------------------------------------
+# Number of IO (instance optimization) finetune steps per pair, matching
+# unigradicon's own CLI default of 50. Set to null to disable IO entirely
+# (zero-shot registration only).
+# registration_finetune_steps: 50
+
+# -----------------------------------------------------------------------------
+# VQGAN encoder
+# -----------------------------------------------------------------------------
+# Path to the trained VQGAN checkpoint used to encode ct0/ct1 crops into
+# latent space (STEP1 of the pipeline).
+vqgan_ckpt: pretrained_models/UCSF_V7_133k_250kSTEPS_recon_loss=0.09.ckpt
+vqgan_chunk_size: 3   
+
+# -----------------------------------------------------------------------------
+# Paired cropping
+# -----------------------------------------------------------------------------
+# Number of organ/tumor-biased crops drawn per ct0/ct1 pair (passed to
+# RandCropByLabelClassesd as num_samples).
+num_samples: 8
+
+# -----------------------------------------------------------------------------
+# Batching / output
+# -----------------------------------------------------------------------------
+# Directory where finished .pt batch files are written.
+scratch_dir: /scratch/rpinise1/EvoTumor/Residuals
+
+# Number of samples (crops) per saved .pt file.
+chunk_size: 64
+
+# Total number of .pt batch files to accumulate before stopping. The loop
+# will pass over the CSV manifest as many times as needed (reshuffling each
+# pass) until this many batches exist in scratch_dir.
+max_batches: 2000000
+
+unigradicon_weights: /projects/bodymaps/Rohin/EvoTumor/STEP0.PrepareData/network_weights/unigradicon1.0/Step_2_final.trch

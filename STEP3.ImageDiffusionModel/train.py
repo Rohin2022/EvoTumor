@@ -8,7 +8,7 @@ import torch
 import os
 from ddpm.unet import UNet
 import time
-from dataset.dataloader import get_loader
+from dataset.dataloader import get_longitudinal_loader
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)
 def run(cfg: DictConfig):
@@ -22,9 +22,7 @@ def run(cfg: DictConfig):
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
             channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
-            out_dim=cfg.model.out_dim,
-            num_continuous_conditioners=10,
-            num_organs=9
+            out_dim=cfg.model.out_dim
         ).cuda()
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
@@ -39,7 +37,7 @@ def run(cfg: DictConfig):
         loss_type=cfg.model.loss_type,
     ).cuda()
 
-    train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
+    train_dataloader, train_sampler, dataset_size = get_longitudinal_loader(cfg.dataset)
 
     val_dataloader=None
 
