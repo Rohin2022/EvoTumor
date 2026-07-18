@@ -444,6 +444,7 @@ def get_loader(args):
         # 5. Finalize
         ToTensord(keys=MASK_KEYS + ["heatmap"]),
     ]
+    
     # breakpoint()
     if args.phase == 'train':
         # training dict part
@@ -504,11 +505,24 @@ def get_loader(args):
 
         train_input["organ_id"] = train_input["organ"].map(organ_mapping).astype(int)
 
-
         organ_counts = train_input['organ'].value_counts()
-        train_input['sample_weight'] = train_input['organ'].apply(
+        organ_weight = train_input['organ'].apply(
             lambda o: 1.0 / np.sqrt(organ_counts[o])
         )
+
+        # NOTE: still "normalized_time_delta" here — the rename to "delta_t"
+        # doesn't happen until step 6, below.
+        delta_t_clipped = train_input['normalized_time_delta'].clip(-3.0, 3.0)
+        bin_width = 0.5
+        train_input['delta_t_bin'] = (delta_t_clipped / bin_width).round() * bin_width
+
+        delta_t_bin_counts = train_input['delta_t_bin'].value_counts()
+        delta_t_weight = train_input['delta_t_bin'].apply(
+            lambda b: 1.0 / np.sqrt(delta_t_bin_counts[b])
+        )
+
+        train_input['sample_weight'] = organ_weight * delta_t_weight
+        train_input = train_input.drop(columns=['delta_t_bin'])
 
         # 4. Normalize numeric features if needed (normalized_time_delta is already
         #    normalized per your columns, so nothing else to standardize here unless
@@ -566,8 +580,6 @@ def get_loader(args):
             sampler=train_sampler, pin_memory=True, persistent_workers=True,
         )
         return train_loader, train_sampler, len(train_dataset)
-
-
 
 def get_key(name):
     # input: name

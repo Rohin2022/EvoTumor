@@ -452,12 +452,12 @@ class Unet3D(nn.Module):
         self.cond_mlp = nn.Sequential(
             nn.Linear(time_dim + self.num_organs, time_dim),
             nn.SiLU(),
-            nn.LayerNorm(time_dim),
+            #nn.LayerNorm(time_dim),
             nn.Linear(time_dim, time_dim)
         )
 
-        nn.init.zeros_(self.cond_mlp[-1].weight)
-        nn.init.zeros_(self.cond_mlp[-1].bias)
+        #nn.init.zeros_(self.cond_mlp[-1].weight)
+        #nn.init.zeros_(self.cond_mlp[-1].bias)
 
         # layers
 
@@ -568,7 +568,7 @@ class Unet3D(nn.Module):
             if delta_t.dim() == 1:
                 delta_t = delta_t.view(batch)
 
-            delta_t_emb = self.delta_t_mlp(delta_t)  # Shape: (B, time_emb_dim)
+            delta_t_emb = self.delta_t_mlp(delta_t * 20)  # Shape: (B, time_emb_dim)
 
             # organ is expected as a one-hot float tensor (B, num_organs)
             cond_input = torch.cat([delta_t_emb, organ], dim=1)
