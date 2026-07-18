@@ -5,7 +5,7 @@ diffusion_num_channels: 4
 out_dim: 1
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/
-results_folder_postfix: 'evo_tumor_mask_diffusion_v5' # 1000 timesteps v1 (actually is 32 dim)
+results_folder_postfix: 'evo_tumor_mask_diffusion_v6' # 1000 timesteps v1 (actually is 32 dim)
 load_milestone: False
 
 batch_size: 1 # 40

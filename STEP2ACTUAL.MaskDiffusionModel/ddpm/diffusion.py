@@ -456,6 +456,20 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
+
+        #nn.init.zeros_(self.cond_mlp[-1].weight)
+        #nn.init.zeros_(self.cond_mlp[-1].bias)
+
+        # auxiliary head: forces tab_emb (cond_mlp's output) to stay
+        # predictive of delta_t, giving delta_t_mlp/cond_mlp a direct
+        # gradient path independent of how the backbone uses `t`
+        self.delta_t_aux_head = nn.Sequential(
+            nn.Linear(time_dim, time_dim // 2),
+            nn.SiLU(),
+            nn.Linear(time_dim // 2, 1)
+        )
+
+
         #nn.init.zeros_(self.cond_mlp[-1].weight)
         #nn.init.zeros_(self.cond_mlp[-1].bias)
 
@@ -513,22 +527,20 @@ class Unet3D(nn.Module):
             nn.Conv3d(dim, out_dim, 1)
         )
 
+
     def forward_with_cond_scale(
         self,
         *args,
         cond_scale=2.,
         **kwargs
     ):
-        logits = self.forward(*args, null_cond_prob=0., **kwargs)
+        logits, _ = self.forward(*args, null_cond_prob=0., **kwargs)
 
-        # If scale is 1 or no condition is passed, return standard logits
         if cond_scale == 1 or 'cond' not in kwargs or kwargs['cond'] is None:
             return logits
 
-        # Unconditional pass: drop 100% of the conditions
-        null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
+        null_logits, _ = self.forward(*args, null_cond_prob=1., **kwargs)
 
-        # CFG Extrapolation
         return null_logits + (logits - null_logits) * cond_scale
 
     def forward(
@@ -574,6 +586,10 @@ class Unet3D(nn.Module):
             cond_input = torch.cat([delta_t_emb, organ], dim=1)
             tab_emb = self.cond_mlp(cond_input)  # Shape: (B, time_emb_dim)
 
+            # aux prediction on the UNDROPPED tab_emb -- supervise cond_mlp's
+            # output directly, before CFG masking zeroes some samples out
+            delta_t_pred = self.delta_t_aux_head(tab_emb).squeeze(-1)  # (B,)
+
             # Reshape mask to (B, 1) for the embedding
             emb_mask = drop_mask.view(batch, 1)
 
@@ -582,6 +598,8 @@ class Unet3D(nn.Module):
 
             # Add to the timestep embedding
             t = t + tab_emb
+        else:
+            delta_t_pred = None
 
         h = []
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
@@ -608,8 +626,10 @@ class Unet3D(nn.Module):
                               focus_present_mask=focus_present_mask)
             x = upsample(x)
 
+
         x = torch.cat((x, r), dim=1)
-        return self.final_conv(x)
+        main_out = self.final_conv(x)
+        return main_out, delta_t_pred
 
 # gaussian diffusion trainer class
 
@@ -644,12 +664,14 @@ class GaussianDiffusion(nn.Module):
         loss_type='l1',
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
+        aux_weight=0.1
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+        self.aux_weight = aux_weight
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -823,17 +845,24 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        x_recon = self.denoise_fn(
-            x_noisy, t, cond=cond, delta_t=delta_t, organ=organ, **kwargs)
+        model_out, delta_t_pred = self.denoise_fn(
+            x_noisy, t, cond=cond, delta_t=delta_t, organ=organ, **kwargs
+        )
 
         if self.loss_type == 'l1':
-            loss = F.l1_loss(noise, x_recon)
+            main_loss = F.l1_loss(noise, model_out)
         elif self.loss_type == 'l2':
-            loss = F.mse_loss(noise, x_recon)
+            main_loss = F.mse_loss(noise, model_out)
         else:
             raise NotImplementedError()
 
-        return loss
+        if delta_t_pred is not None:
+            aux_loss = F.mse_loss(delta_t_pred, delta_t.view(-1))
+        else:
+            aux_loss = torch.zeros((), device=main_loss.device)
+
+        total_loss = main_loss + self.aux_weight * aux_loss
+        return total_loss, main_loss.detach(), aux_loss.detach()
 
     def forward(self, heatmap, tumor_mask_0, tumor_mask_1, organ_mask_0, delta_t, organ=None, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
@@ -1098,7 +1127,7 @@ class Trainer(object):
                 organ = self.prepare_organ_one_hot(data, device=device)
 
                 with autocast(enabled=self.amp):
-                    loss = self.model(
+                    loss, main_loss, aux_loss = self.model(
                         heatmap=heatmap,
                         tumor_mask_0=tumor_mask_0,
                         tumor_mask_1=tumor_mask_1,           # Target for diffusion!
@@ -1114,9 +1143,9 @@ class Trainer(object):
                         loss / self.gradient_accumulate_every).backward()
 
                 if (self.step % 10 == 0):
-                    print(f'{self.step}: {loss.item()}')
+                    print(f'{self.step}: total={loss.item():.6f}  main={main_loss.item():.6f}  aux={aux_loss.item():.6f}')
 
-            log = {'loss': loss.item()}
+            log = {'loss': loss.item(), 'main_loss': main_loss.item(), 'aux_loss': aux_loss.item()}
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -1129,6 +1158,8 @@ class Trainer(object):
 
             lr = self.opt.state_dict()['param_groups'][0]['lr']
             self.writer.add_scalar('Train_Loss', loss.item(), self.step)
+            self.writer.add_scalar('Train_Loss/main', main_loss.item(), self.step)
+            self.writer.add_scalar('Train_Loss/aux', aux_loss.item(), self.step)
             self.writer.add_scalar('Learning_rate', lr, self.step)
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
