@@ -1,0 +1,27 @@
+name: multi_tumor_train
+image_channels: 1
+fold: 0
+
+dataset_list: 'abdomen_atlas_pro'
+data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer/
+organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+transform_root_path: /scratch/rpinise1/EvoTumor/Residuals/transforms
+
+data_txt_path: cross_eval/
+datafile: Datapairs_with_masks.csv
+
+dist: False
+batch_size: 1
+num_workers: 16
+
+space_x: 4.0
+space_y: 4.0
+space_z: 4.0
+roi_x: 32
+roi_y: 32
+roi_z: 32
+num_samples: 1
+phase: train
+
+persistent_cache_dir: /scratch/rpinise1/EvoTumor/EvoMask_V1

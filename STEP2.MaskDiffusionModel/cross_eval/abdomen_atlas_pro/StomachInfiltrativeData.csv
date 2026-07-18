@@ -1,2 +1,0 @@
-bdmap_id,organ,diameter_x_mm,diameter_y_mm,diameter_z_mm,volume_ml,sphericity,surface_volume_ratio,elongation,flatness,max_3d_diameter_mm,num_components,column_task
-BDMAP_00058264,stomach,43.046902656555176,40.8203387260437,25.0,12.913710657287249,0.6324839309287698,0.3258999379905726,0.5514873201367885,0.389587062901723,55.97081460978272,1,volume_ml

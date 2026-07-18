@@ -7,7 +7,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
 
-import random, socket, time, uuid
+import csv, random, socket, time, uuid
 import itk, numpy as np, pandas as pd, torch, hydra
 from omegaconf import DictConfig
 from concurrent.futures import ThreadPoolExecutor
@@ -161,6 +161,15 @@ def crop_image_and_organ_mask(img, org, crop_size=CROP_SIZE):
     return _crop_itk(img, start, crop_size), _crop_itk(org, start, crop_size)
 
 
+def crop_image_only(img, crop_size=CROP_SIZE):
+    """Center-crop img (no mask reference — plain center-of-volume crop)."""
+    img = _pad_to_at_least(img, crop_size)
+    size = np.array(img.GetLargestPossibleRegion().GetSize())
+    crop = np.array(crop_size)
+    start = np.clip((size - crop) // 2, 0, np.maximum(size - crop, 0))
+    return _crop_itk(img, start, crop_size)
+
+
 # =============================================================================
 # Atomic writes
 # =============================================================================
@@ -252,9 +261,89 @@ def register_pair(net, ct0_img, ct1_img, ct0_organ, ct1_organ, finetune_steps=No
     ct1_pre = unigradicon.preprocess(ct1_crop, modality="ct")
     phi, _ = itk_wrapper.register_pair_with_mask(
         net, ct1_pre, ct0_pre,
+        mask_A=ct1_organ_crop,
+        mask_B=ct0_organ_crop,
+        finetune_steps=None,
+    )
+    return phi
+
+
+def register_pair_no_mask(net, ct0_img, ct1_img, finetune_steps=None,
+                           crop_size=CROP_SIZE):
+    """Register ct1 (moving) -> ct0 (fixed) using plain center-of-volume
+    crops and no mask/segmentation kwargs at all -- true unguided
+    registration, used as the fallback when mask-guided registration
+    produces zero tumor-mask Dice overlap."""
+    ct0_crop = crop_image_only(ct0_img, crop_size)
+    ct1_crop = crop_image_only(ct1_img, crop_size)
+
+    ct0_pre = unigradicon.preprocess(ct0_crop, modality="ct")
+    ct1_pre = unigradicon.preprocess(ct1_crop, modality="ct")
+    phi, _ = itk_wrapper.register_pair_with_mask(
+        net, ct1_pre, ct0_pre,
         finetune_steps=finetune_steps,
     )
     return phi
+
+
+# =============================================================================
+# Dice validation on the tumor mask
+# =============================================================================
+def _warp_mask_to_fixed(phi, moving_mask_itk, fixed_reference_itk):
+    """Resample a moving-space mask into fixed space using transform phi
+    (nearest-neighbor, since it's a label mask)."""
+    resampler = itk.ResampleImageFilter.New(moving_mask_itk)
+    resampler.SetTransform(phi)
+    resampler.UseReferenceImageOn()
+    resampler.SetReferenceImage(fixed_reference_itk)
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetInterpolator(
+        itk.NearestNeighborInterpolateImageFunction.New(moving_mask_itk)
+    )
+    resampler.Update()
+    return resampler.GetOutput()
+
+
+def _dice_score(mask_a_itk, mask_b_itk):
+    a = itk.array_from_image(mask_a_itk) > 0
+    b = itk.array_from_image(mask_b_itk) > 0
+    inter = np.logical_and(a, b).sum()
+    denom = a.sum() + b.sum()
+    if denom == 0:
+        # both empty -> nothing to compare; treat as 0 so it gets flagged
+        return 0.0
+    return float(2.0 * inter / denom)
+
+
+def compute_tumor_dice(phi, ct1_tum, ct0_tum):
+    """Warp the moving (ct1) tumor mask into fixed (ct0) space using phi,
+    and compute Dice against the fixed (ct0) tumor mask."""
+    warped_ct1_tum = _warp_mask_to_fixed(phi, ct1_tum, ct0_tum)
+    return _dice_score(warped_ct1_tum, ct0_tum)
+
+
+# =============================================================================
+# CSV logging
+# =============================================================================
+LOG_FIELDS = ["timestamp", "node", "ct0_bdmap", "ct1_bdmap", "organ",
+              "mode", "dice", "saved_path"]
+
+
+def _init_dice_log(log_path):
+    is_new = not os.path.exists(log_path)
+    if is_new:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=LOG_FIELDS).writeheader()
+    return log_path
+
+
+def _append_dice_log(log_path, record):
+    # append is atomic-enough for our purposes (single line write); each
+    # node/process writes its own line, and we open in append mode each time
+    # to remain safe across the ThreadPoolExecutor / multi-node setup.
+    with open(log_path, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=LOG_FIELDS).writerow(record)
 
 
 # =============================================================================
@@ -277,6 +366,11 @@ def run_producer_loop(cfg: DictConfig):
     scratch_dir    = cfg.producer.scratch_dir
     transforms_dir = os.path.join(scratch_dir, "transforms")
     os.makedirs(transforms_dir, exist_ok=True)
+
+    dice_log_path = cfg.producer.get(
+        "dice_log_path", os.path.join(scratch_dir, "dice_log.csv")
+    )
+    _init_dice_log(dice_log_path)
 
     all_rows = load_manifest(cfg)
     print(f"[{NODE_ID}] Loaded {len(all_rows)} pairs", flush=True)
@@ -314,16 +408,49 @@ def run_producer_loop(cfg: DictConfig):
     def handle_row(row, volumes):
         nonlocal processed, consecutive_failures
         out_path = transform_path(transforms_dir, row["ct0_bdmap"], row["ct1_bdmap"], row["organ"])
+        ct0_id, ct1_id, organ = row["ct0_bdmap"], row["ct1_bdmap"], row["organ"]
         try:
             t0 = time.time()
-            (ct0_img, ct0_org, _ct0_tum), (ct1_img, ct1_org, _ct1_tum) = volumes
+            (ct0_img, ct0_org, ct0_tum), (ct1_img, ct1_org, ct1_tum) = volumes
+
+            # --- Attempt 1: mask-guided registration ---
             phi = register_pair(net, ct0_img, ct1_img, ct0_org, ct1_org,
                                 finetune_steps=finetune_steps)
+            dice = compute_tumor_dice(phi, ct1_tum, ct0_tum)
+            mode = "mask"
+
+            # --- Attempt 2: fallback to plain (no-mask) registration ---
+            if dice == 0.0:
+                print(f"[{NODE_ID}] Dice=0 with mask-guided registration for "
+                      f"ct0={ct0_id} ct1={ct1_id} organ={organ}; retrying without "
+                      f"organ mask.", flush=True)
+                phi_nomask = register_pair_no_mask(net, ct0_img, ct1_img,
+                                                    finetune_steps=finetune_steps)
+                dice_nomask = compute_tumor_dice(phi_nomask, ct1_tum, ct0_tum)
+                if dice_nomask > 0.0:
+                    phi, dice, mode = phi_nomask, dice_nomask, "no_mask"
+                else:
+                    # still zero -- keep the no-mask registration anyway, flag it
+                    phi, dice, mode = phi_nomask, dice_nomask, "fallback_zero"
+
             t1 = time.time()
             _atomic_transform_write(phi, out_path)
             processed += 1
+
+            _append_dice_log(dice_log_path, {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "node": NODE_ID,
+                "ct0_bdmap": ct0_id,
+                "ct1_bdmap": ct1_id,
+                "organ": organ,
+                "mode": mode,
+                "dice": f"{dice:.6f}",
+                "saved_path": out_path,
+            })
+
             print(f"[{NODE_ID}] Saved transform {os.path.basename(out_path)} "
-                  f"| registration={t1-t0:.1f}s | total={processed}/{len(rows_to_process)}",
+                  f"| mode={mode} | dice={dice:.4f} | registration={t1-t0:.1f}s "
+                  f"| total={processed}/{len(rows_to_process)}",
                   flush=True)
             consecutive_failures = 0
         except Exception as e:

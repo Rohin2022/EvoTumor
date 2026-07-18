@@ -1,0 +1,33 @@
+name: multi_tumor_train
+image_channels: 1
+fold: 0
+
+dataset_list: 'abdomen_atlas_pro'
+data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer/
+organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+tumor_csv_path: cross_eval/
+tumor_datafile: tumor_metrics_v1.csv
+tumor_masks_datafile: RadiomicsMaskMetricsBadDropped_Train.csv
+transform_root_path: /scratch/rpinise1/EvoTumor/Residuals/transforms
+pair_csv_path: Datapairs_with_masks.csv
+
+
+dist: False
+batch_size: 4
+num_workers: 8
+
+a_min: -1000
+a_max: 500
+b_min: -1.0
+b_max: 1.0
+space_x: 4.0
+space_y: 4.0
+space_z: 4.0
+roi_x: 128
+roi_y: 128
+roi_z: 128
+num_samples: 3
+phase: train
+persistent_cache: True
+persistent_cache_dir: /scratch/rpinise1/EvoTumor/ResidualDiffusionModelVTEMP

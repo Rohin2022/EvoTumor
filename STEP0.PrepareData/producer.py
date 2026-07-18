@@ -7,33 +7,31 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
 
-import time, random, uuid, socket, os, time
-import torch, hydra, itk, numpy as np, pandas as pd
+import json, random, socket, subprocess, time, uuid
+from datetime import datetime
+from pathlib import Path
+
+import itk, numpy as np, pandas as pd, torch, hydra
 from omegaconf import DictConfig
-from concurrent.futures import ThreadPoolExecutor
 
-import unigradicon
-import icon_registration.itk_wrapper as itk_wrapper
-
-from monai.transforms import (
-    Compose, CropForegroundd, SpatialPadd, RandCropByLabelClassesd,
-    RandScaleIntensityd, RandShiftIntensityd, Lambdad, ToTensord,
-)
-from monai.transforms.transform import MapTransform
 from monai.data import MetaTensor
 from monai.transforms import Orientation as MonaiOrientation
-from vq_gan_3d.model.vqgan import VQGAN
 
 
-# =============================================================================
-# Constants
-# =============================================================================
-BACKGROUND, ORGAN, TUMOR = 0, 1, 2
 NODE_ID = f"{socket.gethostname()}_{os.getpid()}"
+CROP_SIZE = (175, 175, 175)
+
+
+def now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def existing_file(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
 
 
 # =============================================================================
-# ITK helpers
+# ITK helpers (preprocessing only — same as before, unrelated to registration)
 # =============================================================================
 def _read_itk(path, pixel_type=itk.F):
     if not os.path.exists(path):
@@ -41,7 +39,7 @@ def _read_itk(path, pixel_type=itk.F):
     return itk.imread(path, pixel_type=pixel_type)
 
 
-def _orient_to_ras(img_itk):
+def _orient_to_ras(img_itk, is_mask=False):
     arr = itk.array_from_image(img_itk)
     spacing   = np.array(img_itk.GetSpacing())
     origin    = np.array(img_itk.GetOrigin())
@@ -57,13 +55,17 @@ def _orient_to_ras(img_itk):
     )
     t_ras = MonaiOrientation(axcodes="RAS")(t)
 
-    new_affine   = t_ras.affine.numpy()
-    new_spacing  = np.sqrt((new_affine[:3, :3] ** 2).sum(axis=0))
-    new_dir      = new_affine[:3, :3] / new_spacing
-    new_origin   = new_affine[:3, 3]
+    new_affine  = t_ras.affine.numpy()
+    new_spacing = np.sqrt((new_affine[:3, :3] ** 2).sum(axis=0))
+    new_dir     = new_affine[:3, :3] / new_spacing
+    new_origin  = new_affine[:3, 3]
 
     arr_out = t_ras.numpy()[0].transpose(2, 1, 0)
-    out = itk.image_from_array(np.ascontiguousarray(arr_out).astype(np.float32))
+    arr_out = np.ascontiguousarray(arr_out)
+    if is_mask:
+        out = itk.image_from_array(np.round(arr_out).astype(np.uint8))
+    else:
+        out = itk.image_from_array(arr_out.astype(np.float32))
     out.SetSpacing(new_spacing.tolist())
     out.SetOrigin(new_origin.tolist())
     out.SetDirection(itk.matrix_from_array(new_dir))
@@ -91,151 +93,85 @@ def _resample_to_spacing(img_itk, target_spacing, is_mask=False):
 
 
 def preprocess_itk(img_itk, target_spacing, is_mask=False):
-    return _resample_to_spacing(_orient_to_ras(img_itk), target_spacing, is_mask)
+    return _resample_to_spacing(_orient_to_ras(img_itk, is_mask=is_mask), target_spacing, is_mask)
 
 
-def _warp_image(moving, fixed, transform):
-    moving_cast, cast_back = unigradicon.maybe_cast(moving)
-    warped = itk.resample_image_filter(
-        moving_cast, transform=transform,
-        interpolator=itk.LinearInterpolateImageFunction.New(moving_cast),
-        use_reference_image=True, reference_image=fixed,
-    )
-    return cast_back(warped)
+# =============================================================================
+# Cropping: deterministic CROP_SIZE crop centered on mask extent
+# =============================================================================
+def _get_center_crop_index(img, mask, crop_size):
+    size = np.array(img.GetLargestPossibleRegion().GetSize())
+    mask_arr = itk.array_from_image(mask)
+
+    nz = np.argwhere(mask_arr > 0)
+    if nz.size == 0:
+        center_zyx = np.array(mask_arr.shape) / 2.0
+    else:
+        bbox_min = nz.min(axis=0)
+        bbox_max = nz.max(axis=0)
+        center_zyx = (bbox_min + bbox_max) / 2.0
+
+    center_xyz = center_zyx[::-1]
+
+    crop = np.array(crop_size)
+    start = np.round(center_xyz - crop / 2.0).astype(int)
+    start = np.clip(start, 0, np.maximum(size - crop, 0))
+    return start
 
 
-def _warp_mask(mask, fixed, transform):
-    r = itk.ResampleImageFilter.New(mask)
-    r.SetInterpolator(itk.NearestNeighborInterpolateImageFunction.New(mask))
-    r.SetTransform(transform)
-    r.SetSize(fixed.GetLargestPossibleRegion().GetSize())
-    r.SetOutputSpacing(fixed.GetSpacing())
-    r.SetOutputOrigin(fixed.GetOrigin())
-    r.SetOutputDirection(fixed.GetDirection())
-    r.SetDefaultPixelValue(0)
-    r.Update()
-    warped = r.GetOutput()
-    arr = (itk.array_from_image(warped) > 0).astype(np.uint8)
-    out = itk.image_from_array(arr)
-    out.SetSpacing(fixed.GetSpacing())
-    out.SetOrigin(fixed.GetOrigin())
-    out.SetDirection(fixed.GetDirection())
+def _pad_to_at_least(img, min_size):
+    size = np.array(img.GetLargestPossibleRegion().GetSize())
+    min_size = np.array(min_size)
+    deficit = np.maximum(min_size - size, 0)
+    if not deficit.any():
+        return img
+    lower = (deficit // 2).tolist()
+    upper = (deficit - deficit // 2).tolist()
+    pad = itk.ConstantPadImageFilter.New(img)
+    pad.SetPadLowerBound([int(x) for x in lower])
+    pad.SetPadUpperBound([int(x) for x in upper])
+    pad.SetConstant(0)
+    pad.Update()
+    return pad.GetOutput()
+
+
+def _crop_itk(img, start, crop_size):
+    start_idx = [int(s) for s in start]
+
+    region = itk.ImageRegion[3]()
+    region.SetIndex(start_idx)
+    region.SetSize([int(c) for c in crop_size])
+
+    extractor = itk.ExtractImageFilter.New(img)
+    extractor.SetExtractionRegion(region)
+    extractor.Update()
+    out = extractor.GetOutput()
+    out.DisconnectPipeline()
+
+    new_origin = img.TransformIndexToPhysicalPoint(start_idx)
+
+    new_region = out.GetLargestPossibleRegion()
+    new_region.SetIndex([0, 0, 0])
+    out.SetRegions(new_region)
+    out.SetOrigin(new_origin)
+
     return out
 
 
-# =============================================================================
-# Registration
-# =============================================================================
-def register_and_warp(net, ct0_img, ct1_img, ct0_organ, ct1_organ, ct1_tumor,
-                      finetune_steps=None):
-    """Register ct1 (moving) → ct0 (fixed) using register_pair_with_mask so
-    the model's similarity loss is masked to the organ region on both sides.
-    The organ masks are passed as mask_A / mask_B and resized internally by
-    itk_wrapper to the network's identity_map shape.
-    """
-    ct0_pre = unigradicon.preprocess(ct0_img, modality="ct")
-    ct1_pre = unigradicon.preprocess(ct1_img, modality="ct")
-
-    phi, _ = itk_wrapper.register_pair_with_mask(
-        net,
-        ct1_pre,          # moving (A)
-        ct0_pre,          # fixed  (B)
-        mask_A=ct1_organ,
-        mask_B=ct0_organ,
-        finetune_steps=None,
-    )
-    return (
-        _warp_image(ct1_img, ct0_img, phi),
-        _warp_mask(ct1_organ, ct0_img, phi),
-        _warp_mask(ct1_tumor, ct0_img, phi),
-    )
+def crop_image_and_organ_mask(img, org, crop_size=CROP_SIZE):
+    """Crop (img, organ_mask) to crop_size, centered on the organ mask's
+    bounding-box center. Falls back to centering on the image if the organ
+    mask is empty."""
+    img = _pad_to_at_least(img, crop_size)
+    org = _pad_to_at_least(org, crop_size)
+    start = _get_center_crop_index(img, org, crop_size)
+    return _crop_itk(img, start, crop_size), _crop_itk(org, start, crop_size)
 
 
 # =============================================================================
-# MONAI pipeline
+# Path helpers
 # =============================================================================
-class CombineMasksToTernaryd(MapTransform):
-    def __init__(self, organ_key="organ_mask_ct0", tumor_key="tumor_mask_ct0",
-                 output_key="label", allow_missing_keys=False):
-        super().__init__(keys=[organ_key, tumor_key], allow_missing_keys=allow_missing_keys)
-        self.organ_key, self.tumor_key, self.output_key = organ_key, tumor_key, output_key
-
-    def __call__(self, data):
-        d = dict(data)
-        label = (d[self.organ_key] > 0.5).to(torch.int64)
-        label[d[self.tumor_key] > 0.5] = 2
-        d[self.output_key] = label
-        d.pop(self.organ_key, None)
-        d.pop(self.tumor_key, None)
-        return d
-
-
-def build_crop_pipeline(cfg):
-    roi = (cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z)
-    crop_keys = ["image_ct0", "image_ct1", "tumor_ct0", "tumor_ct1", "label"]
-    return Compose([
-        CombineMasksToTernaryd(),
-        CropForegroundd(keys=crop_keys, source_key="label",
-                        select_fn=lambda x: x > 0, margin=64, allow_smaller=False),
-        SpatialPadd(keys=crop_keys, spatial_size=roi, mode="constant"),
-        RandCropByLabelClassesd(
-            keys=crop_keys, label_key="label", spatial_size=roi,
-            ratios=[0, 1, 1], num_classes=3,
-            num_samples=cfg.producer.num_samples,
-            image_key="image_ct0", image_threshold=-1,
-        ),
-        RandScaleIntensityd(keys=["image_ct0", "image_ct1"], factors=0.1, prob=0.5),
-        RandShiftIntensityd(keys=["image_ct0", "image_ct1"], offsets=0.1, prob=0.5),
-        Lambdad(keys=["image_ct0", "image_ct1"],
-                func=lambda x: torch.clamp(x, -1.0, 1.0)),
-        ToTensord(keys=crop_keys),
-    ])
-
-
-# =============================================================================
-# VQGAN
-# =============================================================================
-def load_vqgan(ckpt):
-    m = VQGAN.load_from_checkpoint(ckpt, weights_only=False).cuda().eval()
-    with torch.no_grad():
-        emb_min = m.codebook.embeddings.min()
-        emb_max = m.codebook.embeddings.max()
-    return m, emb_min, emb_max
-
-
-@torch.no_grad()
-def encode_batch(vqgan, imgs, emb_min, emb_max):
-    """imgs: (B, 1, X, Y, Z) → normalized latent (B, C, ...)"""
-    imgs = imgs.permute(0, 1, 4, 2, 3)  # → (B,1,Z,X,Y)
-    z = vqgan.encode(imgs, quantize=False, include_embeddings=True)
-    return ((z - emb_min) / (emb_max - emb_min)) * 2.0 - 1.0
-
-
-def encode_crops_batched(vqgan, emb_min, emb_max, crops, vqgan_chunk_size=3):
-    """
-    Encode all ct0/ct1 crops in chunks of vqgan_chunk_size.
-    num_samples (e.g. 8) can exceed vqgan_chunk_size (e.g. 3) — crops are
-    split into ceil(num_samples / vqgan_chunk_size) forward passes.
-    Returns z0s, z1s: (N, C, ...) bfloat16 CPU tensors.
-    """
-    n = len(crops)
-    img0s = torch.stack([c["image_ct0"].as_tensor() for c in crops]).cuda()  # (N,1,X,Y,Z)
-    img1s = torch.stack([c["image_ct1"].as_tensor() for c in crops]).cuda()
-
-    z0s, z1s = [], []
-    for i in range(0, n, vqgan_chunk_size):
-        z0s.append(encode_batch(vqgan, img0s[i:i+vqgan_chunk_size], emb_min, emb_max))
-        z1s.append(encode_batch(vqgan, img1s[i:i+vqgan_chunk_size], emb_min, emb_max))
-
-    z0s = torch.cat(z0s, dim=0).to(torch.bfloat16).cpu()
-    z1s = torch.cat(z1s, dim=0).to(torch.bfloat16).cpu()
-    return z0s, z1s
-
-
-# =============================================================================
-# Path / manifest helpers
-# =============================================================================
-def resolve_paths(cfg, bdmap_id, organ):
+def resolve_source_paths(cfg, bdmap_id, organ):
     organ_dir_name = "gall_bladder" if organ == "gallbladder" else organ
     return (
         os.path.join(cfg.dataset.data_root_path, bdmap_id, "ct.nii.gz"),
@@ -246,10 +182,21 @@ def resolve_paths(cfg, bdmap_id, organ):
     )
 
 
+def pair_id_str(ct0_id, ct1_id, organ):
+    return f"{ct1_id}_to_{ct0_id}_{organ}"
+
+
 def load_manifest(cfg):
     df = pd.read_csv(cfg.dataset.datafile)
-    required = {"ct0_bdmap","ct1_bdmap","ct0_t","ct1_t",
-                "time_delta_readable","unix_delta","normalized_time_delta","organ"}
+    required = {"ct0_bdmap", "ct1_bdmap", "ct0_t", "ct1_t",
+                "time_delta_readable", "unix_delta", "normalized_time_delta", "organ"}
+
+    organs_list = ['bladder', 'colon', 'duodenum', 'esophagus',
+       'gallbladder',
+       'prostate',
+       'spleen', 'stomach',
+       'uterus']
+    df = df[df["organ"].isin(organs_list)]
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Manifest missing columns: {missing}")
@@ -257,207 +204,228 @@ def load_manifest(cfg):
 
 
 # =============================================================================
-# Per-pair processing
+# Building the (cropped, preprocessed) crop volumes on disk for a pair
 # =============================================================================
-def _itk_to_tensor(img_itk):
-    arr = itk.array_from_image(img_itk).astype(np.float32)
-    return torch.from_numpy(arr).unsqueeze(0)  # (1, D, H, W)
-
-
-def _scale(x, a_min, a_max, b_min, b_max):
-    return torch.clamp(x, a_min, a_max).sub_(a_min).div_(a_max - a_min).mul_(b_max - b_min).add_(b_min)
-
-
-def load_and_preprocess_pair(cfg, row):
-    """Load + orient + resample one pair (can be run in a thread)."""
-    ct0_id, ct1_id, organ = row["ct0_bdmap"], row["ct1_bdmap"], row["organ"]
+def prepare_pair_crops(cfg, row, crop_dir: Path):
+    """Load ct0/ct1 + organ/lesion masks, preprocess (RAS + resample), crop
+    each scan independently to CROP_SIZE centered on its own organ mask, and
+    write the crops to crop_dir. Returns a dict of paths, mirroring the
+    prepare-step outputs the other scripts consume."""
     spacing = (cfg.dataset.space_x, cfg.dataset.space_y, cfg.dataset.space_z)
+    ct0_id, ct1_id, organ = row["ct0_bdmap"], row["ct1_bdmap"], row["organ"]
 
-    ct0_img_p, ct0_org_p, ct0_tum_p = resolve_paths(cfg, ct0_id, organ)
-    ct1_img_p, ct1_org_p, ct1_tum_p = resolve_paths(cfg, ct1_id, organ)
+    ct0_img_p, ct0_org_p, ct0_tum_p = resolve_source_paths(cfg, ct0_id, organ)
+    ct1_img_p, ct1_org_p, ct1_tum_p = resolve_source_paths(cfg, ct1_id, organ)
 
-    def load_all(img_p, org_p, tum_p):
-        img = preprocess_itk(_read_itk(img_p), spacing, is_mask=False)
-        org = preprocess_itk(_read_itk(org_p, itk.UC), spacing, is_mask=True)
-        tum = preprocess_itk(_read_itk(tum_p, itk.UC), spacing, is_mask=True)
-        return img, org, tum
+    ct0_img = preprocess_itk(_read_itk(ct0_img_p), spacing, is_mask=False)
+    ct0_org = preprocess_itk(_read_itk(ct0_org_p, itk.UC), spacing, is_mask=True)
+    ct0_tum = preprocess_itk(_read_itk(ct0_tum_p, itk.UC), spacing, is_mask=True)
 
-    return load_all(ct0_img_p, ct0_org_p, ct0_tum_p), load_all(ct1_img_p, ct1_org_p, ct1_tum_p)
+    ct1_img = preprocess_itk(_read_itk(ct1_img_p), spacing, is_mask=False)
+    ct1_org = preprocess_itk(_read_itk(ct1_org_p, itk.UC), spacing, is_mask=True)
+    ct1_tum = preprocess_itk(_read_itk(ct1_tum_p, itk.UC), spacing, is_mask=True)
 
+    ct0_img_crop, ct0_org_crop = crop_image_and_organ_mask(ct0_img, ct0_org)
+    ct1_img_crop, ct1_org_crop = crop_image_and_organ_mask(ct1_img, ct1_org)
+    # crop the lesion masks to the same windows as their own scan
+    ct0_tum_crop = _crop_itk(_pad_to_at_least(ct0_tum, CROP_SIZE),
+                              _get_center_crop_index(_pad_to_at_least(ct0_img, CROP_SIZE),
+                                                      _pad_to_at_least(ct0_org, CROP_SIZE), CROP_SIZE),
+                              CROP_SIZE)
+    ct1_tum_crop = _crop_itk(_pad_to_at_least(ct1_tum, CROP_SIZE),
+                              _get_center_crop_index(_pad_to_at_least(ct1_img, CROP_SIZE),
+                                                      _pad_to_at_least(ct1_org, CROP_SIZE), CROP_SIZE),
+                              CROP_SIZE)
 
-def _process_loaded(cfg, net, crop_pipeline, row, loaded):
-    """Register + crop a pair whose ITK volumes are already loaded."""
-    (ct0_img, ct0_org, ct0_tum), (ct1_img, ct1_org, ct1_tum) = loaded
-
-    t0 = time.time()
-    ct1_img_w, _ct1_org_w, ct1_tum_w = register_and_warp(
-        net, ct0_img, ct1_img, ct0_org, ct1_org, ct1_tum,
-        finetune_steps=cfg.producer.get("registration_finetune_steps", None),
-    )
-    t1 = time.time()
-
-    a_min, a_max = cfg.dataset.a_min, cfg.dataset.a_max
-    b_min, b_max = cfg.dataset.b_min, cfg.dataset.b_max
-
-    data = {
-        "image_ct0":      _scale(_itk_to_tensor(ct0_img),   a_min, a_max, b_min, b_max),
-        "image_ct1":      _scale(_itk_to_tensor(ct1_img_w), a_min, a_max, b_min, b_max),
-        "organ_mask_ct0": _itk_to_tensor(ct0_org),
-        "tumor_mask_ct0": _itk_to_tensor(ct0_tum),
-        "tumor_ct0":      _itk_to_tensor(ct0_tum),
-        "tumor_ct1":      _itk_to_tensor(ct1_tum_w),
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "ct0_ct_crop": crop_dir / f"{ct0_id}_ct_crop.nii.gz",
+        "ct0_organ_crop": crop_dir / f"{ct0_id}_{organ}_crop.nii.gz",
+        "ct0_lesion_crop": crop_dir / f"{ct0_id}_{organ}_lesion_crop.nii.gz",
+        "ct1_ct_crop": crop_dir / f"{ct1_id}_ct_crop.nii.gz",
+        "ct1_organ_crop": crop_dir / f"{ct1_id}_{organ}_crop.nii.gz",
+        "ct1_lesion_crop": crop_dir / f"{ct1_id}_{organ}_lesion_crop.nii.gz",
     }
-    crops = crop_pipeline(data)
-    t2 = time.time()
-
-    print(f"[{NODE_ID}] TIMING  registration={t1-t0:.1f}s  crops={t2-t1:.1f}s", flush=True)
-
-    crops = crops if isinstance(crops, list) else [crops]
-    return crops, row
+    itk.imwrite(ct0_img_crop, str(paths["ct0_ct_crop"]))
+    itk.imwrite(ct0_org_crop, str(paths["ct0_organ_crop"]))
+    itk.imwrite(ct0_tum_crop, str(paths["ct0_lesion_crop"]))
+    itk.imwrite(ct1_img_crop, str(paths["ct1_ct_crop"]))
+    itk.imwrite(ct1_org_crop, str(paths["ct1_organ_crop"]))
+    itk.imwrite(ct1_tum_crop, str(paths["ct1_lesion_crop"]))
+    return paths
 
 
 # =============================================================================
-# Save
+# Registration + warp — identical CLI pattern to the other scripts
 # =============================================================================
-def save_batch(batch_dict, scratch_dir, idx):
-    fname = f"batch_{idx:06d}_{NODE_ID}_{uuid.uuid4().hex[:8]}"
-    tmp   = os.path.join(scratch_dir, f"_{fname}.pt.tmp")
-    final = os.path.join(scratch_dir, f"{fname}.pt")
-    torch.save(batch_dict, tmp)
-    os.rename(tmp, final)  # atomic on POSIX filesystems
-    return final
+def append_log(path: Path, title: str, command: list, dry_run: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[{now()}] {title}\n")
+        handle.write("dry_run: " + str(dry_run) + "\n")
+        handle.write("command: " + " ".join(command) + "\n")
+
+
+def run_command(command: list, log_path: Path, dry_run: bool) -> int:
+    append_log(log_path, "run", command, dry_run)
+    if dry_run:
+        return 0
+    with log_path.open("a", encoding="utf-8") as log_handle:
+        process = subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
+    return process.returncode
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def process_pair(row, cfg, transforms_dir: Path, crops_root: Path, statuses_dir: Path,
+                  model: str, io_iterations: int, overwrite: bool, dry_run: bool) -> dict:
+    ct0_id, ct1_id, organ = row["ct0_bdmap"], row["ct1_bdmap"], row["organ"]
+    pid = pair_id_str(ct0_id, ct1_id, organ)
+
+    crop_dir = crops_root / pid
+    transform_path = transforms_dir / f"{pid}.h5"
+    warped_ct_path = transforms_dir / f"{pid}_ct1_warped_to_ct0.nii.gz"
+    warped_lesion_path = transforms_dir / f"{pid}_ct1_lesion_warped_to_ct0.nii.gz"
+    status_path = statuses_dir / f"{pid}.json"
+    log_path = transforms_dir / "logs" / f"{pid}.log"
+
+    payload = {
+        "pair_id": pid,
+        "ct0_bdmap": ct0_id,
+        "ct1_bdmap": ct1_id,
+        "organ": organ,
+        "transform": str(transform_path),
+        "warped_ct": str(warped_ct_path),
+        "warped_lesion": str(warped_lesion_path),
+        "started_at": now(),
+        "status": "started",
+    }
+
+    if existing_file(transform_path) and existing_file(warped_lesion_path) and not overwrite:
+        payload["status"] = "skipped_existing"
+        payload["finished_at"] = now()
+        write_json(status_path, payload)
+        return payload
+
+    try:
+        crop_paths = prepare_pair_crops(cfg, row, crop_dir)
+    except Exception as exc:  # noqa: BLE001 - keep the loop going, record failure
+        payload["status"] = "prepare_failed"
+        payload["error"] = str(exc)
+        payload["finished_at"] = now()
+        write_json(status_path, payload)
+        return payload
+
+    register_command = [
+        "unigradicon-register",
+        "--fixed", str(crop_paths["ct0_ct_crop"]),
+        "--fixed_modality", "ct",
+        "--moving", str(crop_paths["ct1_ct_crop"]),
+        "--moving_modality", "ct",
+        "--transform_out", str(transform_path),
+        "--warped_moving_out", str(warped_ct_path),
+        "--model", model,
+        "--io_iterations", str(io_iterations),
+    ]
+    return_code = run_command(register_command, log_path, dry_run)
+    if return_code != 0:
+        payload["status"] = "register_failed"
+        payload["returncode"] = return_code
+        payload["finished_at"] = now()
+        write_json(status_path, payload)
+        return payload
+
+    warp_command = [
+        "unigradicon-warp",
+        "--fixed", str(crop_paths["ct0_ct_crop"]),
+        "--moving", str(crop_paths["ct1_lesion_crop"]),
+        "--transform", str(transform_path),
+        "--warped_moving_out", str(warped_lesion_path),
+        "--nearest_neighbor",
+    ]
+    return_code = run_command(warp_command, log_path, dry_run)
+    if return_code != 0:
+        payload["status"] = "warp_failed"
+        payload["returncode"] = return_code
+        payload["finished_at"] = now()
+        write_json(status_path, payload)
+        return payload
+
+    payload["status"] = "ok" if not dry_run else "dry_run"
+    payload["finished_at"] = now()
+    write_json(status_path, payload)
+    return payload
 
 
 # =============================================================================
 # Main loop
 # =============================================================================
 def run_producer_loop(cfg: DictConfig):
-    print(f"[{NODE_ID}] Starting producer", flush=True)
+    print(f"[{NODE_ID}] Starting producer (unigradicon CLI, register+warp)", flush=True)
 
-    net = unigradicon.get_unigradicon()
-    net.cuda().eval()
+    scratch_dir    = Path(cfg.producer.scratch_dir)
+    transforms_dir = scratch_dir / "transforms"
+    crops_root     = scratch_dir / "_crops"
+    statuses_dir   = scratch_dir / "status"
+    transforms_dir.mkdir(parents=True, exist_ok=True)
+    crops_root.mkdir(parents=True, exist_ok=True)
+    statuses_dir.mkdir(parents=True, exist_ok=True)
 
-    vqgan, emb_min, emb_max = load_vqgan(cfg.producer.vqgan_ckpt)
-    crop_pipeline = build_crop_pipeline(cfg)
-    scratch_dir = cfg.producer.scratch_dir
-    os.makedirs(scratch_dir, exist_ok=True)
-
-    existing = len([f for f in os.listdir(scratch_dir)
-                    if f.endswith(".pt") and not f.startswith("_")])
-    print(f"[{NODE_ID}] Found {existing} existing .pt files", flush=True)
-
-    batches_saved    = existing
-    max_batches      = cfg.producer.max_batches
-    chunk_size       = cfg.producer.chunk_size
-    vqgan_chunk_size = cfg.producer.get("vqgan_chunk_size", 3)
+    model         = cfg.producer.get("model", "unigradicon")
+    io_iterations = cfg.producer.get("io_iterations", 50)
+    overwrite     = cfg.producer.get("overwrite", False)
+    dry_run       = cfg.producer.get("dry_run", False)
 
     all_rows = load_manifest(cfg)
     print(f"[{NODE_ID}] Loaded {len(all_rows)} pairs", flush=True)
+    random.shuffle(all_rows)
 
-    buffer = []
+    max_pairs = cfg.producer.get("max_pairs", cfg.producer.get("max_batches", len(all_rows)))
+
+    def already_done(row):
+        pid = pair_id_str(row["ct0_bdmap"], row["ct1_bdmap"], row["organ"])
+        return existing_file(transforms_dir / f"{pid}.h5") and \
+            existing_file(transforms_dir / f"{pid}_ct1_lesion_warped_to_ct0.nii.gz")
+
+    rows_to_process = all_rows if overwrite else [r for r in all_rows if not already_done(r)]
+    skipped_existing = len(all_rows) - len(rows_to_process)
+    print(f"[{NODE_ID}] {skipped_existing} pairs already have transforms, "
+          f"{len(rows_to_process)} remaining", flush=True)
+
+    rows_to_process = rows_to_process[:max_pairs]
+    if not rows_to_process:
+        print(f"[{NODE_ID}] Nothing to do. Done.", flush=True)
+        return
+
+    processed = 0
     consecutive_failures = 0
-    last_save_time = time.time()
 
-    # Prefetch: load+preprocess the next pair on a background thread while
-    # the current pair is being registered (CPU/disk vs GPU overlap).
-    executor = ThreadPoolExecutor(max_workers=1)
+    for index, row in enumerate(rows_to_process, start=1):
+        pid = pair_id_str(row["ct0_bdmap"], row["ct1_bdmap"], row["organ"])
+        print(f"[{NODE_ID}] [{index}/{len(rows_to_process)}] {pid}", flush=True)
+        t0 = time.time()
+        result = process_pair(
+            row, cfg, transforms_dir, crops_root, statuses_dir,
+            model=model, io_iterations=io_iterations, overwrite=overwrite, dry_run=dry_run,
+        )
+        t1 = time.time()
+        print(f"[{NODE_ID}]   status={result['status']} ({t1 - t0:.1f}s)", flush=True)
 
-    def submit_load(row):
-        return executor.submit(load_and_preprocess_pair, cfg, row)
+        if result["status"].startswith("ok") or result["status"] == "dry_run":
+            processed += 1
+            consecutive_failures = 0
+        elif result["status"] != "skipped_existing":
+            consecutive_failures += 1
+            if consecutive_failures >= 10:
+                raise RuntimeError("10 consecutive failures — storage may be offline.")
 
-    while batches_saved < max_batches:
-        random.shuffle(all_rows)
-        rows_iter = iter(all_rows)
-
-        # Prime the prefetch queue with the first row
-        try:
-            first_row = next(rows_iter)
-        except StopIteration:
-            break
-        prefetch_future = submit_load(first_row)
-        prefetch_row    = first_row
-
-        for next_row in rows_iter:
-            if batches_saved >= max_batches:
-                break
-
-            row = prefetch_row
-            # Start loading the next pair immediately (overlaps with registration below)
-            next_future     = submit_load(next_row)
-
-            try:
-                loaded = prefetch_future.result()  # blocks only if not ready yet
-                crops, row = _process_loaded(cfg, net, crop_pipeline, row, loaded)
-                z0s, z1s = encode_crops_batched(vqgan, emb_min, emb_max, crops,
-                                               vqgan_chunk_size=vqgan_chunk_size)
-                for i, crop in enumerate(crops):
-                    buffer.append({
-                        "residual":              (z1s[i] - z0s[i]),
-                        "z0":                    z0s[i],
-                        "normalized_time_delta": torch.tensor(float(row["normalized_time_delta"]),
-                                                              dtype=torch.float32),
-                        "organ":      row["organ"],
-                        "tumor_ct0":  crop["tumor_ct0"].as_tensor().to(torch.uint8),
-                        "tumor_ct1_warped": crop["tumor_ct1"].as_tensor().to(torch.uint8),
-                        "ct0_bdmap":  row["ct0_bdmap"],
-                        "ct1_bdmap":  row["ct1_bdmap"],
-                    })
-                consecutive_failures = 0
-
-            except Exception as e:
-                consecutive_failures += 1
-                print(f"[{NODE_ID}] FAILED ct0={row.get('ct0_bdmap')} "
-                      f"ct1={row.get('ct1_bdmap')} organ={row.get('organ')}: {e}", flush=True)
-                if consecutive_failures >= 10:
-                    raise RuntimeError("10 consecutive failures — storage may be offline.")
-
-            prefetch_future = next_future
-            prefetch_row    = next_row
-
-        # Process the last row in the epoch (no next_row to prefetch after it)
-        if batches_saved < max_batches:
-            row = prefetch_row
-            try:
-                loaded = prefetch_future.result()
-                crops, row = _process_loaded(cfg, net, crop_pipeline, row, loaded)
-                z0s, z1s = encode_crops_batched(vqgan, emb_min, emb_max, crops,
-                                               vqgan_chunk_size=vqgan_chunk_size)
-                for i, crop in enumerate(crops):
-                    buffer.append({
-                        "residual":              (z1s[i] - z0s[i]),
-                        "z0":                    z0s[i],
-                        "normalized_time_delta": torch.tensor(float(row["normalized_time_delta"]),
-                                                              dtype=torch.float32),
-                        "organ":      row["organ"],
-                        "tumor_ct0":  crop["tumor_ct0"].as_tensor().to(torch.uint8),
-                        "tumor_ct1_warped": crop["tumor_ct1"].as_tensor().to(torch.uint8),
-                        "ct0_bdmap":  row["ct0_bdmap"],
-                        "ct1_bdmap":  row["ct1_bdmap"],
-                    })
-                consecutive_failures = 0
-            except Exception as e:
-                consecutive_failures += 1
-                print(f"[{NODE_ID}] FAILED ct0={row.get('ct0_bdmap')} "
-                      f"ct1={row.get('ct1_bdmap')} organ={row.get('organ')}: {e}", flush=True)
-                if consecutive_failures >= 10:
-                    raise RuntimeError("10 consecutive failures — storage may be offline.")
-
-            while len(buffer) >= chunk_size:
-                chunk, buffer = buffer[:chunk_size], buffer[chunk_size:]
-                batch = {k: torch.stack([d[k] for d in chunk])
-                         if isinstance(chunk[0][k], torch.Tensor) else [d[k] for d in chunk]
-                         for k in chunk[0]}
-
-                batches_saved += 1
-                path = save_batch(batch, scratch_dir, batches_saved)
-                now  = time.time()
-                dt   = now - last_save_time
-                last_save_time = now
-                print(f"[{NODE_ID}] Saved {os.path.basename(path)} "
-                      f"| total={batches_saved}/{max_batches} "
-                      f"| Δt={dt:.1f}s | {chunk_size/dt:.0f} samples/s", flush=True)
-
-    print(f"[{NODE_ID}] Done. Total: {batches_saved}", flush=True)
+    print(f"[{NODE_ID}] Done. Processed {processed} pairs "
+          f"({skipped_existing} already existed).", flush=True)
 
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)

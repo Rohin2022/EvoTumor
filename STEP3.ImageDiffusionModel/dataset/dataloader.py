@@ -319,7 +319,40 @@ class TumorMaskUnionDilated(MapTransform):
         d[self.binary_tumor_mask_union] = (mask_union > 0.5).float()
         return d
  
+import datetime
 
+def _log_cache_event(name, data):
+    """Prints whenever a deterministic transform actually executes (i.e. cache miss)."""
+    ct0 = data.get("ct0_bdmap", "?")
+    ct1 = data.get("ct1_bdmap", "?")
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[CACHE-BUILD {ts}] Running '{name}' for pair ({ct0} -> {ct1}) "
+          f"— this should print exactly once per pair per persistent cache.",
+          flush=True)
+
+
+class CacheRunLogger(Transform):
+    """
+    Wraps a deterministic transform and logs every time it is actually
+    executed. Must subclass Transform (not just be a plain callable) or
+    PersistentDataset._pre_transform will bail out on the first wrapped
+    transform in the Compose list and cache nothing (see prior debugging).
+
+    Use this to confirm: deterministic transforms run once per item when
+    building/populating the persistent cache, and never again afterward
+    (subsequent epochs should only exercise the stochastic crop stage).
+    """
+    def __init__(self, transform):
+        self.transform = transform
+        self.name = transform.__class__.__name__
+
+    def __call__(self, data):
+        if isinstance(data, list):
+            for d in data:
+                _log_cache_event(self.name, d)
+            return [self.transform(d) for d in data]
+        _log_cache_event(self.name, data)
+        return self.transform(data)
 
 
 class LongitudinalAugDataset(torch.utils.data.Dataset):
@@ -389,16 +422,15 @@ def get_longitudinal_loader(args):
       - args.tumor_mask_union_sigma (optional, default 1.5): blur sigma
         for the dilated tumor union mask
     """
- 
     deterministic_transforms = Compose(
         [
-            LoadAndRegisterPaird(
+            CacheRunLogger(LoadAndRegisterPaird(
                 fixed_key="ct0",
                 moving_key="ct1",
                 fixed_extra_keys=["organ_mask_fixed", "tumor_mask_fixed"],
                 moving_extra_keys=["organ_mask_moving", "tumor_mask_moving"],
                 transform_root=args.transform_root_path,
-            ),
+            )),
             Orientationd(keys=LOADED_KEYS, axcodes="RAS"),
             Spacingd(
                 keys=LOADED_KEYS,
