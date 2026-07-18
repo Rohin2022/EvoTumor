@@ -82,7 +82,7 @@ def run(cfg: DictConfig):
     # 2. Load checkpoint (prefer EMA weights for eval)
     # ------------------------------------------------------------------
     ckpt_dir = Path(cfg.model.results_folder)
-    ckpt_path = ckpt_dir / f"model_best.pt"
+    ckpt_path = ckpt_dir / f"55.pt"
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
 
