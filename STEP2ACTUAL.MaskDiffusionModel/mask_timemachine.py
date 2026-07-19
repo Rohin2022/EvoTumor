@@ -36,7 +36,7 @@ from ddpm import Unet3D, GaussianDiffusion
 # checked dataset_norm_stats.json (if you kept one) or the raw column's
 # mean/std to know what a "1 year back" equivalent actually looks like in
 # normalized units.
-DELTA_T_SWEEP = [0.0, -0.5, -1.0, -1.5, -2.0, -2.5, -3.0]
+DELTA_T_SWEEP = [3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5, -2.0, -2.5, -3.0]
 
 # Fixed seed so the initial noise is reproducible across separate script runs.
 NOISE_SEED = 42
@@ -110,7 +110,7 @@ def run(cfg: DictConfig):
 
     num_deltas = len(DELTA_T_SWEEP)
     T_START = diffusion.num_timesteps
-    cond_scale = 2.0
+    cond_scale = 6.0
 
     n_items = len(dataloader) if MAX_ITEMS is None else min(MAX_ITEMS, len(dataloader))
     print(f"Running delta_t sweep over {n_items} dataset items, "

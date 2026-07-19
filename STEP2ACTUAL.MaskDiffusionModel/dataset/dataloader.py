@@ -22,6 +22,7 @@ from monai.transforms import (
     Orientationd,
     RandFlipd,
     RandCropByPosNegLabeld,
+    DeleteItemsd,
     RandShiftIntensityd,
     ScaleIntensityRanged,
     Spacingd,
@@ -58,38 +59,13 @@ sys.path.append("..")
 
 
 DEFAULT_POST_FIX = PostFix.meta()
-class LoadAndRegisterPaird(MapTransform):
+class LoadPairedMasksd(MapTransform):
     """
-    Loads tumor_mask and organ_mask for both the fixed (ct0) and moving (ct1)
-    timepoints, reads a precomputed ITK transform (written with
-    `itk.transformwrite`, e.g. a uniGradICON DisplacementFieldTransform/
-    CompositeTransform saved as "{ct0_bdmap}_to_{ct1_bdmap}_{organ}.h5" under
-    `transform_root`), and warps the moving (ct1) masks onto the fixed (ct0)
-    grid with nearest-neighbor interpolation. Fixed-frame masks are loaded
-    as-is, no warp needed.
+    Loads tumor_mask and organ_mask for both timepoints (ct0 and ct1)
+    with no registration/warping applied — each mask is loaded as-is,
+    on its own native grid.
 
     Output keys: tumor_mask_0, tumor_mask_1, organ_mask_0, organ_mask_1
-    (all in the fixed/ct0 grid).
-
-    *** DIRECTION CHECK NEEDED ***
-    Based on your `register_pair` snippet:
-        itk_wrapper.register_pair_with_mask(net, ct1_pre, ct0_pre, ...)
-    called as (moving=ct1, fixed=ct0). Depending on how your fork of
-    icon_registration/uniGradICON defines `register_pair_with_mask`'s return
-    value, `phi` may be:
-      (a) the transform ITK's ResampleImageFilter expects directly, i.e. a
-          mapping from the fixed (reference/output) grid to the moving
-          (input) grid — this is what's assumed below, or
-      (b) the "forward" moving->fixed transform, in which case you need
-          `phi.GetInverseTransform()` (or the inverse displacement field)
-          before passing it to resample_image_filter.
-    Get this wrong and the warp will be silently incorrect (not error out) —
-    please confirm against how `register_pair_with_mask` is used elsewhere
-    in your codebase before trusting this. `invert_transform` is left as a
-    flag so you can flip it in one place.
-
-    Requires `ct0_bdmap`, `ct1_bdmap`, and `organ` to already be present in
-    the data dict as plain strings (not tensors).
     """
 
     def __init__(
@@ -98,11 +74,6 @@ class LoadAndRegisterPaird(MapTransform):
         tumor_mask_moving_key: str = "tumor_mask_moving",
         organ_mask_fixed_key: str = "organ_mask_fixed",
         organ_mask_moving_key: str = "organ_mask_moving",
-        transform_root: str = None,
-        id_key_1: str = "ct0_bdmap",
-        id_key_2: str = "ct1_bdmap",
-        organ_key: str = "organ",
-        invert_transform: bool = False,
         allow_missing_keys: bool = False,
     ):
         all_keys = [
@@ -116,93 +87,28 @@ class LoadAndRegisterPaird(MapTransform):
         self.tumor_mask_moving_key = tumor_mask_moving_key
         self.organ_mask_fixed_key = organ_mask_fixed_key
         self.organ_mask_moving_key = organ_mask_moving_key
-        self.transform_root = transform_root
-        self.id_key_1 = id_key_1
-        self.id_key_2 = id_key_2
-        self.organ_key = organ_key
-        self.invert_transform = invert_transform
 
         import itk as _itk
         from monai.data import ITKReader
         self._itk = _itk
         self._itk_reader = ITKReader()
 
-    def _load_transform(self, ct0_bdmap, ct1_bdmap, organ):
-        fname = f"{ct0_bdmap}_to_{ct1_bdmap}_{organ}.h5"
-        fpath = os.path.join(self.transform_root, fname)
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(f"No precomputed transform found at {fpath}")
-        transforms = self._itk.transformread(fpath)
-        transform = transforms[0]
-        if self.invert_transform:
-            transform = transform.GetInverseTransform()
-        return transform
-
-    def _warp(self, moving_itk, fixed_itk, transform, interpolator, default_pixel_value):
-        return self._itk.resample_image_filter(
-            moving_itk,
-            transform=transform,
-            interpolator=interpolator,
-            use_reference_image=True,
-            reference_image=fixed_itk,
-            default_pixel_value=default_pixel_value,
-        )
-
-    def _load_mask(self, itk, path):
-        mask_itk = itk.imread(path, itk.UC)
+    def _load_mask(self, path):
+        mask_itk = self._itk.imread(path, self._itk.UC)
         arr, meta = self._itk_reader.get_data(mask_itk)
         arr = np.squeeze(arr)  # drop any trailing/leading singleton component dim from ITK
-        return mask_itk, MetaTensor(arr, affine=meta["affine"]), meta
+        return MetaTensor(arr, affine=meta["affine"])
 
     def __call__(self, data):
-        itk = self._itk
         d = dict(data)
 
-        ct0_bdmap = d[self.id_key_1]
-        ct1_bdmap = d[self.id_key_2]
-        organ = d[self.organ_key]
+        # --- timepoint 0 (ct0): load only, no warp ---
+        d["tumor_mask_0"] = self._load_mask(d[self.tumor_mask_fixed_key])
+        d["organ_mask_0"] = self._load_mask(d[self.organ_mask_fixed_key])
 
-        transform = self._load_transform(ct0_bdmap, ct1_bdmap, organ)
-
-        # --- fixed-frame masks (ct0): load only, no warp needed ---
-        tumor_fixed_itk, tumor_0_tensor, tumor_0_meta = self._load_mask(
-            itk, d[self.tumor_mask_fixed_key]
-        )
-        organ_fixed_itk, organ_0_tensor, organ_0_meta = self._load_mask(
-            itk, d[self.organ_mask_fixed_key]
-        )
-
-        d["tumor_mask_0"] = tumor_0_tensor
-        d["organ_mask_0"] = organ_0_tensor
-
-        # --- moving-frame masks (ct1): load, then warp onto ct0 grid ---
-        tumor_moving_itk = itk.imread(d[self.tumor_mask_moving_key], itk.UC)
-        organ_moving_itk = itk.imread(d[self.organ_mask_moving_key], itk.UC)
-
-        tumor_nn_interp = itk.NearestNeighborInterpolateImageFunction.New(tumor_moving_itk)
-        warped_tumor_itk = self._warp(
-            tumor_moving_itk, tumor_fixed_itk, transform, tumor_nn_interp,
-            default_pixel_value=0,
-        )
-        organ_nn_interp = itk.NearestNeighborInterpolateImageFunction.New(organ_moving_itk)
-        warped_organ_itk = self._warp(
-            organ_moving_itk, organ_fixed_itk, transform, organ_nn_interp,
-            default_pixel_value=0,
-        )
-
-        warped_tumor_arr, warped_tumor_meta = self._itk_reader.get_data(warped_tumor_itk)
-
-        warped_organ_arr, warped_organ_meta = self._itk_reader.get_data(warped_organ_itk)
-
-        d["tumor_mask_0"] = tumor_0_tensor
-        d["organ_mask_0"] = organ_0_tensor
-        d["tumor_mask_1"] = MetaTensor(warped_tumor_arr, affine=warped_tumor_meta["affine"])
-        d["organ_mask_1"] = MetaTensor(warped_organ_arr, affine=warped_organ_meta["affine"])
-
-        # NOTE: intentionally not stashing *_meta_dict entries in `d` — they contain
-        # raw numpy fields (affine, spacing, etc.) that list_data_collate can choke
-        # on during batching, and nothing downstream reads them. The affine is
-        # still preserved on each MetaTensor itself if you need it later.
+        # --- timepoint 1 (ct1): load only, no warp ---
+        d["tumor_mask_1"] = self._load_mask(d[self.tumor_mask_moving_key])
+        d["organ_mask_1"] = self._load_mask(d[self.organ_mask_moving_key])
 
         for key in (
             self.tumor_mask_fixed_key,
@@ -211,12 +117,6 @@ class LoadAndRegisterPaird(MapTransform):
             self.organ_mask_moving_key,
         ):
             d.pop(key, None)
-
-        del (
-            tumor_fixed_itk, organ_fixed_itk,
-            tumor_moving_itk, organ_moving_itk,
-            warped_tumor_itk, warped_organ_itk,
-        )
 
         return d
 
@@ -302,6 +202,7 @@ class GenerateTumorHeatmapd(MapTransform):
         if len(indices) == 0:
             # Fallback if no tumor is present (blank heatmap)
             heatmap = torch.zeros_like(mask_tensor)
+            print("EMPTY HEATMAP", data["ct1_bdmap"])
         else:
             # 1. Get exact X, Y, Z centroid
             centroid = indices.float().mean(dim=0)
@@ -374,60 +275,162 @@ class ComputeTSDFd(MapTransform):
                 tsdf_out[c] = tsdf
 
             # Return tensor in same device/format it arrived in
-            d[key] = torch.from_numpy(tsdf_out) if isinstance(
-                mask, torch.Tensor) else tsdf_out
+            d[key] = torch.from_numpy(tsdf_out)
 
         return d
 
 
+class LogMissingClass1d(MapTransform):
+    """
+    Passthrough diagnostic transform. Checks whether `label_key` has any
+    nonzero (class-1 / tumor) voxels, and if not, logs the record's
+    ct0_bdmap/ct1_bdmap/organ/delta_t to a file. Does not modify the data
+    in any way -- safe to drop in anywhere in the pipeline, including
+    directly before RandCropByLabelClassesd, to see exactly which records
+    are about to trigger MONAI's "no available indices of class 1 to crop"
+    warning.
+ 
+    Usage: insert into `deterministic_transforms` (to check once, on the
+    cached/full volume) or into `stochastic_transforms` right before
+    RandCropByLabelClassesd (to check every epoch, in case upstream
+    randomness -- e.g. registration -- could vary presence between runs).
+    """
+ 
+    def __init__(self, label_key="tumor_mask_1", allow_missing_keys=False,
+                 log_path="missing_class1_log.csv", tag=""):
+        super().__init__([label_key], allow_missing_keys)
+        self.label_key = label_key
+        self.log_path = log_path
+        self.tag = tag
+        self._wrote_header = os.path.exists(log_path)
+ 
+    def __call__(self, data):
+        d = dict(data)
+        mask = d[self.label_key]
+        mask_tensor = mask if isinstance(mask, torch.Tensor) else torch.tensor(mask)
+ 
+        n_class1 = (mask_tensor > 0).sum().item()
+ 
+        if n_class1 == 0:
+            ct0 = d.get("ct0_bdmap", "<unknown>")
+            ct1 = d.get("ct1_bdmap", "<unknown>")
+            organ = d.get("organ", "<unknown>")
+            delta_t = d.get("delta_t", "<unknown>")
+ 
+            print(f"[LogMissingClass1d{(':' + self.tag) if self.tag else ''}] "
+                  f"NO CLASS-1 VOXELS  ct0={ct0}  ct1={ct1}  organ={organ}  delta_t={delta_t}")
+ 
+            # append to a simple CSV log so you get a persistent record across
+            # a full epoch / multiple runs without needing to scrape stdout
+            write_header = not self._wrote_header
+            with open(self.log_path, "a") as f:
+                if write_header:
+                    f.write("tag,ct0_bdmap,ct1_bdmap,organ,delta_t,n_class1_voxels\n")
+                    self._wrote_header = True
+                f.write(f"{self.tag},{ct0},{ct1},{organ},{delta_t},{n_class1}\n")
+ 
+        # passthrough -- never modifies the data
+        return d
+
+class CreateUnionMaskd(MapTransform):
+    """
+    Computes the union of an organ mask and tumor mask for a given timepoint
+    and stores it under `out_key`. Used purely as a scratch key to drive
+    CropForegroundd's bounding-box computation (union of both structures),
+    not intended to be carried downstream as model input.
+    """
+    def __init__(self, organ_key: str, tumor_key: str, out_key: str):
+        super().__init__(keys=[organ_key, tumor_key])
+        self.organ_key = organ_key
+        self.tumor_key = tumor_key
+        self.out_key = out_key
+
+    def __call__(self, data):
+        d = dict(data)
+        organ = d[self.organ_key]
+        tumor = d[self.tumor_key]
+
+        if isinstance(organ, torch.Tensor):
+            union = torch.logical_or(organ > 0, tumor > 0).to(organ.dtype)
+        else:
+            union = np.logical_or(organ > 0, tumor > 0).astype(organ.dtype)
+
+        d[self.out_key] = union
+        return d
+
 
 def get_loader(args):
+
     MASK_KEYS = ["tumor_mask_0", "tumor_mask_1", "organ_mask_0", "organ_mask_1"]
 
-
     deterministic_transforms = [
-        LoadAndRegisterPaird(
+        LoadPairedMasksd(
             tumor_mask_fixed_key="tumor_mask_fixed",
             tumor_mask_moving_key="tumor_mask_moving",
             organ_mask_fixed_key="organ_mask_fixed",
             organ_mask_moving_key="organ_mask_moving",
-            transform_root=args.transform_root_path,
         ),
         EnsureChannelFirstd(keys=MASK_KEYS, channel_dim="no_channel"),
-
-        # 1. Restructure the full volume first
         Orientationd(keys=MASK_KEYS, axcodes="RAS"),
         Spacingd(
             keys=MASK_KEYS,
             pixdim=(args.space_x, args.space_y, args.space_z),
             mode=("nearest", "nearest", "nearest", "nearest"),
         ),
-        SpatialPadd(
-            keys=MASK_KEYS,
-            spatial_size=(args.roi_x, args.roi_y, args.roi_z),
-            mode="constant",
+
+        # Build per-timepoint union masks (organ ∪ tumor) purely to drive cropping
+        CreateUnionMaskd(organ_key="organ_mask_0", tumor_key="tumor_mask_0", out_key="union_mask_0"),
+        CreateUnionMaskd(organ_key="organ_mask_1", tumor_key="tumor_mask_1", out_key="union_mask_1"),
+
+        # Crop each timepoint's mask set to the union bounding box, margin=40
+        CropForegroundd(
+            keys=["tumor_mask_0", "organ_mask_0", "union_mask_0"],
+            source_key="union_mask_0",
+            select_fn=lambda x: x > 0,
+            allow_smaller=True,
+            margin=40,
+        ),
+        CropForegroundd(
+            keys=["tumor_mask_1", "organ_mask_1", "union_mask_1"],
+            source_key="union_mask_1",
+            select_fn=lambda x: x > 0,
+            allow_smaller=True,
+            margin=40,
         ),
 
-        # 2. Heatmap, built only from tumor_mask_1, before cropping
-        GenerateTumorHeatmapd(ref_key="tumor_mask_1", out_key="heatmap", sigma=8.0),
+        DeleteItemsd(keys=["union_mask_0", "union_mask_1",
+                    "foreground_start_coord", "foreground_end_coord"]),
+
+        SpatialPadd(
+            keys=MASK_KEYS,
+            spatial_size=(175, 175, 175),
+            mode="constant",
+        ),
+        CenterSpatialCropd(roi_size=(175, 175, 175), keys=MASK_KEYS),
+
+
+
+        LogMissingClass1d(label_key="tumor_mask_1", tag="post_pad_pre_crop",
+                        log_path="missing_class1_log.csv"),
     ]
 
     # ----------------------------------------------------------------------
     # STOCHASTIC: anything randomized (crop) plus everything downstream of it
-    # (TSDF must run on the post-crop patch, not the full volume, so it stays
-    # here even though it's not random itself — caching it would freeze the
-    # TSDF to whatever the first random crop happened to produce).
     # ----------------------------------------------------------------------
     stochastic_transforms = [
-        # 3. Crop and pad (heatmap sliced identically to the masks)
+        # Random crop biased toward tumor, using tumor_mask_1 as the driving key
         RandCropByLabelClassesd(
-            keys=MASK_KEYS + ["heatmap"],
+            keys=MASK_KEYS,
             label_key="tumor_mask_1",
             spatial_size=(args.roi_x, args.roi_y, args.roi_z),
             ratios=[1, 10000],
             num_classes=2,
             num_samples=args.num_samples,
         ),
+
+        GenerateTumorHeatmapd(ref_key="tumor_mask_1", out_key="heatmap", sigma=8.0),
+
+
         SpatialPadd(
             keys=MASK_KEYS + ["heatmap"],
             spatial_size=(args.roi_x, args.roi_y, args.roi_z),
@@ -438,13 +441,10 @@ def get_loader(args):
             roi_size=(args.roi_x, args.roi_y, args.roi_z),
         ),
 
-        # 4. TSDF on all four cropped masks; heatmap stays a raw 0-to-1 Gaussian
         ComputeTSDFd(keys=MASK_KEYS),
 
-        # 5. Finalize
         ToTensord(keys=MASK_KEYS + ["heatmap"]),
     ]
-    
     # breakpoint()
     if args.phase == 'train':
         # training dict part
