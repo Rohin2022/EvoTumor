@@ -25,6 +25,7 @@ def run(cfg: DictConfig):
             dim_mults=cfg.model.dim_mults,
             # target (1) + img_cond (tumor_mask_0 + organ_mask_0 + heatmap)
             channels=cfg.model.diffusion_num_channels,
+            total_onc_cond=199,
             out_dim=1,
             num_organs=9
         ).cuda()

@@ -385,6 +385,7 @@ class Unet3D(nn.Module):
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
         channels=3,
+        total_onc_cond=79, # {feature name: cardinality}
         attn_heads=8,
         attn_dim_head=32,
         init_dim=None,
@@ -427,7 +428,7 @@ class Unet3D(nn.Module):
 
         # time conditioning (diffusion timestep)
 
-        time_dim = dim * 4
+        time_dim = dim * 8
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
             nn.Linear(dim, time_dim),
@@ -440,6 +441,7 @@ class Unet3D(nn.Module):
 
         self.num_organs = num_organs
 
+
         self.delta_t_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
             nn.Linear(dim, time_dim),
@@ -447,10 +449,13 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
+
+        self.total_onc_cond = total_onc_cond
+
         # combine delta_t embedding with organ one-hot
 
         self.cond_mlp = nn.Sequential(
-            nn.Linear(time_dim + self.num_organs, time_dim),
+            nn.Linear(time_dim + self.num_organs + self.total_onc_cond, time_dim), # delta_t embedding + organ one hot embedding + onc one hot / multi hot embedding
             nn.SiLU(),
             #nn.LayerNorm(time_dim),
             nn.Linear(time_dim, time_dim)
@@ -550,6 +555,7 @@ class Unet3D(nn.Module):
         cond=None,
         delta_t=None,
         organ=None,
+        onc_cond=None,
         null_cond_prob=0.,
         focus_present_mask=None,
         prob_focus_present=0.
@@ -583,7 +589,7 @@ class Unet3D(nn.Module):
             delta_t_emb = self.delta_t_mlp(delta_t * 20)  # Shape: (B, time_emb_dim)
 
             # organ is expected as a one-hot float tensor (B, num_organs)
-            cond_input = torch.cat([delta_t_emb, organ], dim=1)
+            cond_input = torch.cat([delta_t_emb, organ, onc_cond], dim=1)
             tab_emb = self.cond_mlp(cond_input)  # Shape: (B, time_emb_dim)
 
             # aux prediction on the UNDROPPED tab_emb -- supervise cond_mlp's
@@ -737,10 +743,10 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, delta_t=None, organ=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, delta_t=None, onc_cond=None, organ=None, cond_scale=1.):
         x_recon = self.predict_start_from_noise(
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(
-                x, t, cond=cond, delta_t=delta_t, organ=organ, cond_scale=cond_scale))
+                x, t, cond=cond, delta_t=delta_t, onc_cond=onc_cond, organ=organ, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -761,29 +767,29 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, delta_t=None, organ=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond=None, delta_t=None, onc_cond=None, organ=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, delta_t=delta_t, organ=organ, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond=cond, onc_cond=onc_cond, delta_t=delta_t, organ=organ, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
                                                       *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, delta_t=None, organ=None, cond_scale=1.):
+    def p_sample_loop(self, shape, cond=None, delta_t=None, onc_cond=None, organ=None, cond_scale=1.):
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, delta_t=delta_t, organ=organ, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), cond=cond, delta_t=delta_t, onc_cond=onc_cond, organ=organ, cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
-    def sample(self, heatmap, tumor_mask_0, organ_mask_0, delta_t=None, organ=None, cond_scale=1., batch_size=None):
+    def sample(self, heatmap, tumor_mask_0, organ_mask_0, delta_t=None, onc_cond=None, organ=None, cond_scale=1., batch_size=None):
         device = next(self.denoise_fn.parameters()).device
 
         # Match forward(): permute to (B, C, D, H, W), then concat tumor_mask_0 + organ_mask_0 + heatmap
@@ -809,6 +815,7 @@ class GaussianDiffusion(nn.Module):
             cond=cond,
             delta_t=delta_t,
             organ=organ,
+            onc_cond=onc_cond,
             cond_scale=cond_scale
         )
 
@@ -840,13 +847,13 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, delta_t=None, organ=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, delta_t=None, onc_cond=None, organ=None, noise=None, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         model_out, delta_t_pred = self.denoise_fn(
-            x_noisy, t, cond=cond, delta_t=delta_t, organ=organ, **kwargs
+            x_noisy, t, cond=cond, delta_t=delta_t, onc_cond=onc_cond, organ=organ, **kwargs
         )
 
         if self.loss_type == 'l1':
@@ -864,7 +871,7 @@ class GaussianDiffusion(nn.Module):
         total_loss = main_loss + self.aux_weight * aux_loss
         return total_loss, main_loss.detach(), aux_loss.detach()
 
-    def forward(self, heatmap, tumor_mask_0, tumor_mask_1, organ_mask_0, delta_t, organ=None, null_cond_prob=0.0, *args, **kwargs):
+    def forward(self, heatmap, tumor_mask_0, tumor_mask_1, organ_mask_0, delta_t, onc_cond=None, organ=None, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
         tumor_mask_0 = tumor_mask_0.permute(0, 1, -1, -3, -2)
         tumor_mask_1 = tumor_mask_1.permute(0, 1, -1, -3, -2)
@@ -886,7 +893,7 @@ class GaussianDiffusion(nn.Module):
 
         delta_t = delta_t.to(device).float()
 
-        return self.p_losses(target_mask, t, cond=cond, delta_t=delta_t, organ=organ,
+        return self.p_losses(target_mask, t, cond=cond, delta_t=delta_t, onc_cond=onc_cond, organ=organ,
                               null_cond_prob=null_cond_prob, *args, **kwargs)
 
 # trainer class
@@ -1126,6 +1133,8 @@ class Trainer(object):
 
                 organ = self.prepare_organ_one_hot(data, device=device)
 
+                onc_cond = data["onc_cond"].to(device)
+
                 with autocast(enabled=self.amp):
                     loss, main_loss, aux_loss = self.model(
                         heatmap=heatmap,
@@ -1134,6 +1143,7 @@ class Trainer(object):
                         organ_mask_0=organ_mask_0,           # Spatial condition
                         delta_t=delta_t,                     # Continuous condition
                         organ=organ,                         # One-hot condition
+                        onc_cond=onc_cond,
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                         null_cond_prob=0.1
@@ -1204,7 +1214,7 @@ class Trainer(object):
                             (recon_latent.shape[0],), i, device=recon_latent.device, dtype=torch.long)
 
                         recon_latent = self.ema_model.p_sample(
-                            recon_latent, t_i, cond=cond, delta_t=delta_t, organ=organ, cond_scale=2.0)
+                            recon_latent, t_i, cond=cond, delta_t=delta_t, onc_cond=onc_cond, organ=organ, cond_scale=2.0)
 
                     recon = recon_latent.permute(0, 1, -2, -1, -3)
 

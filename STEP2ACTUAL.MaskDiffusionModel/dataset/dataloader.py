@@ -359,6 +359,128 @@ class CreateUnionMaskd(MapTransform):
         return d
 
 
+_BDMAP_MAP_CACHE = {}  # csv_path -> {bdmap_id (str): patient_id (str)}
+ 
+ 
+def _load_bdmap_mapping(args):
+    csv_path = args.bdmap_mapping_csv
+    if csv_path in _BDMAP_MAP_CACHE:
+        return _BDMAP_MAP_CACHE[csv_path]
+ 
+    bdmap_col = getattr(args, "bdmap_col", "bdmap_id")
+    patient_col = getattr(args, "patient_col", "patient_id")
+ 
+    df = pd.read_csv(csv_path, dtype=str)
+    missing_cols = {bdmap_col, patient_col} - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"bdmap mapping CSV {csv_path} is missing expected column(s) "
+            f"{missing_cols}. Found columns: {list(df.columns)}"
+        )
+ 
+    mapping = dict(zip(df[bdmap_col], df[patient_col]))
+    _BDMAP_MAP_CACHE[csv_path] = mapping
+    return mapping
+ 
+ 
+def bdmap_to_patient(bdmap_id, args):
+    """
+    Returns the patient id for a given ct bdmap id, using the mapping CSV
+    at args.bdmap_mapping_csv (cached in-process after first load).
+ 
+    Raises KeyError if bdmap_id isn't found -- a missing id/patient mapping
+    means downstream tumor/organ mask paths would also be wrong, so this
+    fails loudly rather than silently returning None. If you'd rather skip
+    unmapped rows instead of raising, filter train_input on this before
+    calling, or catch KeyError at the call site.
+    """
+    mapping = _load_bdmap_mapping(args)
+    bdmap_id = str(bdmap_id)
+    if bdmap_id not in mapping:
+        raise KeyError(
+            f"bdmap_id '{bdmap_id}' not found in mapping CSV "
+            f"{args.bdmap_mapping_csv}"
+        )
+    return mapping[bdmap_id]
+ 
+
+import json
+from .onc_condition_encoder import OncConditionEncoder
+ 
+# ----------------------------------------------------------------------
+# get_onc_conditioning
+# ----------------------------------------------------------------------
+ 
+_ONC_ENCODER_CACHE = {}  # onc_conditioning_dir -> OncConditionEncoder
+ 
+ 
+def _get_onc_encoder(args):
+    onc_dir = args.onc_conditioning_dir
+    if onc_dir in _ONC_ENCODER_CACHE:
+        return _ONC_ENCODER_CACHE[onc_dir]
+ 
+    # Use the first .json file found (alphabetically, for determinism) as
+    # the vocab reference. All conditioning JSONs in this folder are
+    # expected to share identical schema/vocab since build_conditioning.py
+    # derives it from the same fixed canonicalization folder for every
+    # patient -- so which file is picked as reference doesn't matter.
+    candidates = sorted(
+        f for f in os.listdir(onc_dir)
+        if f.endswith(".json") and not f.endswith(".log")
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No conditioning JSON files found in {onc_dir} to use as a "
+            f"vocab reference for OncConditionEncoder."
+        )
+ 
+    ref_path = os.path.join(onc_dir, candidates[0])
+    with open(ref_path) as f:
+        reference_conditioning = json.load(f)
+ 
+    encoder = OncConditionEncoder(reference_conditioning)
+    _ONC_ENCODER_CACHE[onc_dir] = encoder
+    print(f"[get_onc_conditioning] Built onc_cond encoder from reference "
+          f"'{ref_path}'. {encoder.describe()}")
+    return encoder
+
+
+
+def get_onc_conditioning(patient_id, args):
+    """
+    Loads the conditioning JSON for `patient_id` from
+    args.onc_conditioning_dir/{patient_id}.json and encodes it into a
+    fixed-order onc_cond vector via OncConditionEncoder.
+ 
+    Returns a numpy float32 array of shape (encoder.total_dim,) --
+    numpy rather than a torch tensor so it round-trips cleanly through
+    pandas .apply()/PersistentDataset caching (both pickle-based); it gets
+    converted to a torch tensor downstream by MONAI's collate_fn like any
+    other array-valued key.
+ 
+    If the patient's conditioning JSON is missing, this WARNS and returns
+    an all-zero vector of the correct shape (equivalent to "no known
+    oncology conditioning for this patient") rather than raising, so a
+    handful of patients missing RadGPT notes doesn't kill the whole
+    data-prep run. Tighten this to raise instead if you'd rather catch
+    missing conditioning data explicitly during data prep.
+    """
+    encoder = _get_onc_encoder(args)
+ 
+    cond_path = os.path.join(args.onc_conditioning_dir, f"{patient_id}.json")
+    if not os.path.exists(cond_path):
+        warnings.warn(
+            f"[get_onc_conditioning] No conditioning JSON for patient "
+            f"'{patient_id}' at {cond_path} -- using all-zero onc_cond."
+        )
+        return np.zeros(encoder.total_dim, dtype=np.float32)
+ 
+    with open(cond_path) as f:
+        conditioning = json.load(f)
+ 
+    return encoder.encode(conditioning).numpy().astype(np.float32)
+ 
+
 def get_loader(args):
 
     MASK_KEYS = ["tumor_mask_0", "tumor_mask_1", "organ_mask_0", "organ_mask_1"]
@@ -471,6 +593,14 @@ def get_loader(args):
             axis=1
         )
 
+        train_input["patient_id"] = train_input.apply(
+            lambda row: bdmap_to_patient(row["ct0_bdmap"], args), axis=1
+        )
+
+        train_input["onc_cond"] = train_input.apply(
+            lambda row: get_onc_conditioning(row["patient_id"], args), axis=1
+        )
+
         # --- organ mask paths (fixed = ct0, moving = ct1) ---
         train_input["organ_mask_fixed"] = train_input.apply(
             lambda row: os.path.join(args.organ_segmentations_root_path, str(
@@ -537,7 +667,8 @@ def get_loader(args):
             "tumor_mask_fixed", "tumor_mask_moving",
             "organ_mask_fixed", "organ_mask_moving", 
             "sample_weight",
-            "organ_id"
+            "organ_id",
+            "onc_cond"
         ]
         train_input = train_input[keep_cols]
 
