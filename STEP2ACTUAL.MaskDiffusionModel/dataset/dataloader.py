@@ -122,58 +122,62 @@ class LoadPairedMasksd(MapTransform):
         return d
 
 
-class RandZoomd_select(RandZoomd):
-    def __call__(self, data):
+from monai.transforms.io.array import LoadImage, SaveImage
+from monai.data.image_reader import ImageReader
+
+
+class LoadImageh5d(MapTransform):
+    def __init__(
+        self,
+        keys: KeysCollection,
+        reader: Optional[Union[ImageReader, str]] = None,
+        dtype: DtypeLike = np.float32,
+        meta_keys: Optional[KeysCollection] = None,
+        meta_key_postfix: str = DEFAULT_POST_FIX,
+        overwriting: bool = False,
+        image_only: bool = False,
+        ensure_channel_first: bool = False,
+        simple_keys: bool = False,
+        allow_missing_keys: bool = False,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(keys, allow_missing_keys)
+        self._loader = LoadImage(
+            reader, image_only, dtype, ensure_channel_first, simple_keys, *args, **kwargs)
+        if not isinstance(meta_key_postfix, str):
+            raise TypeError(
+                f"meta_key_postfix must be a str but is {type(meta_key_postfix).__name__}.")
+        self.meta_keys = ensure_tuple_rep(
+            None, len(self.keys)) if meta_keys is None else ensure_tuple(meta_keys)
+        if len(self.keys) != len(self.meta_keys):
+            raise ValueError("meta_keys should have the same length as keys.")
+        self.meta_key_postfix = ensure_tuple_rep(
+            meta_key_postfix, len(self.keys))
+        self.overwriting = overwriting
+
+    def register(self, reader: ImageReader):
+        self._loader.register(reader)
+
+    def __call__(self, data, reader: Optional[ImageReader] = None):
         d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']):
-            return d
-        d = super().__call__(d)
+        for key, meta_key, meta_key_postfix in self.key_iterator(d, self.meta_keys, self.meta_key_postfix):
+            data = self._loader(d[key], reader)
+            if self._loader.image_only:
+                d[key] = data
+            else:
+                if not isinstance(data, (tuple, list)):
+                    raise ValueError(
+                        "loader must return a tuple or list (because image_only=False was used).")
+                d[key] = data[0]
+                if not isinstance(data[1], dict):
+                    raise ValueError("metadata must be a dict.")
+                meta_key = meta_key or f"{key}_{meta_key_postfix}"
+                if meta_key in d and not self.overwriting:
+                    raise KeyError(
+                        f"Metadata with key {meta_key} already exists and overwriting=False.")
+                d[meta_key] = data[1]
         return d
-
-
-class RandCropByPosNegLabeld_select(RandCropByPosNegLabeld):
-    def __call__(self, data):
-        d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        # if key in ['10_03', '10_07', '10_08', '04']
-        if key in ['10_03', '10_07', '10_08', '04', '05']:
-            return d
-        d = super().__call__(d)
-        return d
-
-
-class RandCropByLabelClassesd_select(RandCropByLabelClassesd):
-    def __call__(self, data):
-        d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        # print('key',key)
-        # if key in ['10_03', '10_07', '10_08', '04']
-        if key not in ['10_03', '10_07', '10_08', '04', '05']:
-            return d
-        d = super().__call__(d)
-        return d
-
-
-class Compose_Select(Compose):
-    def __call__(self, input_):
-        name = input_['name']
-        key = get_key(name)
-        for index, _transform in enumerate(self.transforms):
-            # for RandCropByPosNegLabeld and RandCropByLabelClassesd case
-            if (key in ['10_03', '10_07', '10_08', '04']) and (index == 8):
-                continue
-            elif (key not in ['10_03', '10_07', '10_08', '04']) and (index == 9):
-                continue
-            # for RandZoomd case
-            if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']) and (index == 7):
-                continue
-            input_ = apply_transform(
-                _transform, input_, self.map_items, self.unpack_items, self.log_stats)
-        return input_
 
 
 class GenerateTumorHeatmapd(MapTransform):
@@ -566,99 +570,197 @@ def get_loader(args):
 
     MASK_KEYS = ["tumor_mask_0", "tumor_mask_1", "organ_mask_0", "organ_mask_1"]
 
-    deterministic_transforms = [
-        LoadPairedMasksd(
-            tumor_mask_fixed_key="tumor_mask_fixed",
-            tumor_mask_moving_key="tumor_mask_moving",
-            organ_mask_fixed_key="organ_mask_fixed",
-            organ_mask_moving_key="organ_mask_moving",
-        ),
-        EnsureChannelFirstd(keys=MASK_KEYS, channel_dim="no_channel"),
-        Orientationd(keys=MASK_KEYS, axcodes="RAS"),
-        Spacingd(
-            keys=MASK_KEYS,
-            pixdim=(args.space_x, args.space_y, args.space_z),
-            mode=("nearest", "nearest", "nearest", "nearest"),
-        ),
+    if(args.include_img):
+        deterministic_transforms = [
+            LoadImageh5d(keys=["ct0"]),
+            LoadPairedMasksd(
+                tumor_mask_fixed_key="tumor_mask_fixed",
+                tumor_mask_moving_key="tumor_mask_moving",
+                organ_mask_fixed_key="organ_mask_fixed",
+                organ_mask_moving_key="organ_mask_moving",
+            ),
+            EnsureChannelFirstd(keys=MASK_KEYS + ["ct0"], channel_dim="no_channel"),
+            Orientationd(keys=MASK_KEYS + ["ct0"], axcodes="RAS"),
+            Spacingd(
+                keys=MASK_KEYS + ["ct0"],
+                pixdim=(args.space_x, args.space_y, args.space_z),
+                mode=("nearest", "nearest", "nearest", "nearest","bilinear"),
+            ),
 
-        # Build per-timepoint union masks (organ ∪ tumor) purely to drive cropping
-        CreateUnionMaskd(organ_key="organ_mask_0", tumor_key="tumor_mask_0", out_key="union_mask_0"),
-        CreateUnionMaskd(organ_key="organ_mask_1", tumor_key="tumor_mask_1", out_key="union_mask_1"),
+            # Build per-timepoint union masks (organ ∪ tumor) purely to drive cropping
+            CreateUnionMaskd(organ_key="organ_mask_0", tumor_key="tumor_mask_0", out_key="union_mask_0"),
+            CreateUnionMaskd(organ_key="organ_mask_1", tumor_key="tumor_mask_1", out_key="union_mask_1"),
 
-        # Crop each timepoint's mask set to the union bounding box, margin=40
-        CropForegroundd(
-            keys=["tumor_mask_0", "organ_mask_0", "union_mask_0"],
-            source_key="union_mask_0",
-            select_fn=lambda x: x > 0,
-            allow_smaller=True,
-            margin=40,
-        ),
-        CropForegroundd(
-            keys=["tumor_mask_1", "organ_mask_1", "union_mask_1"],
-            source_key="union_mask_1",
-            select_fn=lambda x: x > 0,
-            allow_smaller=True,
-            margin=40,
-        ),
+            # Crop each timepoint's mask set to the union bounding box, margin=40
+            CropForegroundd(
+                keys=["tumor_mask_0", "organ_mask_0", "union_mask_0","ct0"],
+                source_key="union_mask_0",
+                select_fn=lambda x: x > 0,
+                allow_smaller=True,
+                margin=40,
+            ),
+            CropForegroundd(
+                keys=["tumor_mask_1", "organ_mask_1", "union_mask_1","ct0"],
+                source_key="union_mask_1",
+                select_fn=lambda x: x > 0,
+                allow_smaller=True,
+                margin=40,
+            ),
 
-        DeleteItemsd(keys=["union_mask_0", "union_mask_1",
-                    "foreground_start_coord", "foreground_end_coord"]),
+            DeleteItemsd(keys=["union_mask_0", "union_mask_1",
+                        "foreground_start_coord", "foreground_end_coord"]),
 
-        SpatialPadd(
-            keys=MASK_KEYS,
-            spatial_size=(175, 175, 175),
-            mode="constant",
-        ),
-        CenterSpatialCropd(roi_size=(175, 175, 175), keys=MASK_KEYS),
-
-
-
-        LogMissingClass1d(label_key="tumor_mask_1", tag="post_pad_pre_crop",
-                        log_path="missing_class1_log.csv"),
-    ]
-    
-
-    # ----------------------------------------------------------------------
-    # STOCHASTIC: anything randomized (crop) plus everything downstream of it
-    # ----------------------------------------------------------------------
-    stochastic_transforms = [
-        # Random crop biased toward tumor, using tumor_mask_1 as the driving key
-        ZeroDeltaTIdentityd(
-            tumor_mask_0_key="tumor_mask_0",
-            tumor_mask_1_key="tumor_mask_1",
-            organ_mask_0_key="organ_mask_0",
-            organ_mask_1_key="organ_mask_1",
-            delta_t_key="delta_t",
-            prob=args.zero_delta_t_prob,
-        ),
-        RandCropByLabelClassesd(
-            keys=MASK_KEYS,
-            label_key="tumor_mask_1",
-            spatial_size=(args.roi_x, args.roi_y, args.roi_z),
-            ratios=[1, 10000],
-            num_classes=2,
-            num_samples=args.num_samples,
-        ),
-
-        GenerateTumorHeatmapd(ref_key="tumor_mask_1", out_key="heatmap", sigma=8.0),
+            SpatialPadd(
+                keys=MASK_KEYS,
+                spatial_size=(175, 175, 175),
+                mode="constant",
+            ),
+            CenterSpatialCropd(roi_size=(175, 175, 175), keys=MASK_KEYS),
 
 
-        SpatialPadd(
-            keys=MASK_KEYS + ["heatmap"],
-            spatial_size=(args.roi_x, args.roi_y, args.roi_z),
-            mode="constant",
-        ),
-        CenterSpatialCropd(
-            keys=MASK_KEYS + ["heatmap"],
-            roi_size=(args.roi_x, args.roi_y, args.roi_z),
-        ),
 
-        ComputeTSDFd(keys=MASK_KEYS),
+            LogMissingClass1d(label_key="tumor_mask_1", tag="post_pad_pre_crop",
+                            log_path="missing_class1_log.csv"),
+        ]
+        
 
-        ToTensord(keys=MASK_KEYS + ["heatmap", "delta_t", "organ_id","onc_cond"]),
-        SelectItemsd(keys=MASK_KEYS+["heatmap","onc_cond","delta_t", "organ_id"]),
 
-    ]
+        # ----------------------------------------------------------------------
+        # STOCHASTIC: anything randomized (crop) plus everything downstream of it
+        # ----------------------------------------------------------------------
+        stochastic_transforms = [
+            # Random crop biased toward tumor, using tumor_mask_1 as the driving key
+            ZeroDeltaTIdentityd(
+                tumor_mask_0_key="tumor_mask_0",
+                tumor_mask_1_key="tumor_mask_1",
+                organ_mask_0_key="organ_mask_0",
+                organ_mask_1_key="organ_mask_1",
+                delta_t_key="delta_t",
+                prob=args.zero_delta_t_prob,
+            ),
+            RandCropByLabelClassesd(
+                keys=MASK_KEYS + ["ct0"],
+                label_key="tumor_mask_1",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                ratios=[1, 10000],
+                num_classes=2,
+                num_samples=args.num_samples,
+            ),
+
+            GenerateTumorHeatmapd(ref_key="tumor_mask_1", out_key="heatmap", sigma=8.0),
+
+
+            SpatialPadd(
+                keys=MASK_KEYS + ["heatmap", "ct0"],
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                mode="constant",
+            ),
+            CenterSpatialCropd(
+                keys=MASK_KEYS + ["heatmap", "ct0"],
+                roi_size=(args.roi_x, args.roi_y, args.roi_z),
+            ),
+
+            ComputeTSDFd(keys=MASK_KEYS),
+
+            ToTensord(keys=MASK_KEYS + ["heatmap", "delta_t", "organ_id","onc_cond", "ct0"]),
+            SelectItemsd(keys=MASK_KEYS+["heatmap","onc_cond","delta_t", "organ_id", "ct0"]),
+
+        ]
+    else:
+        deterministic_transforms = [
+            LoadPairedMasksd(
+                tumor_mask_fixed_key="tumor_mask_fixed",
+                tumor_mask_moving_key="tumor_mask_moving",
+                organ_mask_fixed_key="organ_mask_fixed",
+                organ_mask_moving_key="organ_mask_moving",
+            ),
+            EnsureChannelFirstd(keys=MASK_KEYS, channel_dim="no_channel"),
+            Orientationd(keys=MASK_KEYS, axcodes="RAS"),
+            Spacingd(
+                keys=MASK_KEYS,
+                pixdim=(args.space_x, args.space_y, args.space_z),
+                mode=("nearest", "nearest", "nearest", "nearest"),
+            ),
+
+            # Build per-timepoint union masks (organ ∪ tumor) purely to drive cropping
+            CreateUnionMaskd(organ_key="organ_mask_0", tumor_key="tumor_mask_0", out_key="union_mask_0"),
+            CreateUnionMaskd(organ_key="organ_mask_1", tumor_key="tumor_mask_1", out_key="union_mask_1"),
+
+            # Crop each timepoint's mask set to the union bounding box, margin=40
+            CropForegroundd(
+                keys=["tumor_mask_0", "organ_mask_0", "union_mask_0"],
+                source_key="union_mask_0",
+                select_fn=lambda x: x > 0,
+                allow_smaller=True,
+                margin=40,
+            ),
+            CropForegroundd(
+                keys=["tumor_mask_1", "organ_mask_1", "union_mask_1"],
+                source_key="union_mask_1",
+                select_fn=lambda x: x > 0,
+                allow_smaller=True,
+                margin=40,
+            ),
+
+            DeleteItemsd(keys=["union_mask_0", "union_mask_1",
+                        "foreground_start_coord", "foreground_end_coord"]),
+
+            SpatialPadd(
+                keys=MASK_KEYS,
+                spatial_size=(175, 175, 175),
+                mode="constant",
+            ),
+            CenterSpatialCropd(roi_size=(175, 175, 175), keys=MASK_KEYS),
+
+
+
+            LogMissingClass1d(label_key="tumor_mask_1", tag="post_pad_pre_crop",
+                            log_path="missing_class1_log.csv"),
+        ]
+        
+
+
+        # ----------------------------------------------------------------------
+        # STOCHASTIC: anything randomized (crop) plus everything downstream of it
+        # ----------------------------------------------------------------------
+        stochastic_transforms = [
+            # Random crop biased toward tumor, using tumor_mask_1 as the driving key
+            ZeroDeltaTIdentityd(
+                tumor_mask_0_key="tumor_mask_0",
+                tumor_mask_1_key="tumor_mask_1",
+                organ_mask_0_key="organ_mask_0",
+                organ_mask_1_key="organ_mask_1",
+                delta_t_key="delta_t",
+                prob=args.zero_delta_t_prob,
+            ),
+            RandCropByLabelClassesd(
+                keys=MASK_KEYS,
+                label_key="tumor_mask_1",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                ratios=[1, 10000],
+                num_classes=2,
+                num_samples=args.num_samples,
+            ),
+
+            GenerateTumorHeatmapd(ref_key="tumor_mask_1", out_key="heatmap", sigma=8.0),
+
+
+            SpatialPadd(
+                keys=MASK_KEYS + ["heatmap"],
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                mode="constant",
+            ),
+            CenterSpatialCropd(
+                keys=MASK_KEYS + ["heatmap"],
+                roi_size=(args.roi_x, args.roi_y, args.roi_z),
+            ),
+
+            ComputeTSDFd(keys=MASK_KEYS),
+
+            ToTensord(keys=MASK_KEYS + ["heatmap", "delta_t", "organ_id","onc_cond"]),
+            SelectItemsd(keys=MASK_KEYS+["heatmap","onc_cond","delta_t", "organ_id"]),
+
+        ]
     # breakpoint()
     if args.phase == 'train':
         # training dict part
@@ -702,6 +804,12 @@ def get_loader(args):
         train_input["organ_mask_moving"] = train_input.apply(
             lambda row: os.path.join(args.organ_segmentations_root_path, str(
                 row["ct1_bdmap"]), "segmentations", f"{parseOrganName(row['organ'])}.nii.gz"),
+            axis=1
+        )
+
+        train_input["ct0"] = train_input.apply(
+            lambda row: os.path.join(args.image_root_path, str(
+                row["ct0_bdmap"]), "ct.nii.gz"),
             axis=1
         )
 
@@ -760,7 +868,8 @@ def get_loader(args):
             "organ_mask_fixed", "organ_mask_moving", 
             "sample_weight",
             "organ_id",
-            "onc_cond"
+            "onc_cond",
+            "ct0"
         ]
         train_input = train_input[keep_cols]
 

@@ -31,6 +31,8 @@ from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
 
+from vq_gan_3d.model.vqgan import VQGAN
+
 
 def exists(x):
     return x is not None
@@ -691,7 +693,9 @@ class GaussianDiffusion(nn.Module):
         loss_type='l1',
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
-        aux_weight=0.1
+        aux_weight=0.1,
+        vqgan_ckpt=None,
+        full_size=(128,128,128)
     ):
         super().__init__()
         self.channels = channels
@@ -699,6 +703,14 @@ class GaussianDiffusion(nn.Module):
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
         self.aux_weight = aux_weight
+
+        self.full_size = full_size
+
+        if vqgan_ckpt:
+            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt,weights_only=False).cuda()
+            self.vqgan.eval()
+        else:
+            self.vqgan = None
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -892,7 +904,7 @@ class GaussianDiffusion(nn.Module):
         total_loss = main_loss + self.aux_weight * aux_loss
         return total_loss, main_loss.detach(), aux_loss.detach()
 
-    def forward(self, heatmap, tumor_mask_0, tumor_mask_1, organ_mask_0, delta_t, onc_cond=None, organ=None, null_cond_prob=0.0, *args, **kwargs):
+    def forward(self, heatmap, tumor_mask_0, tumor_mask_1, organ_mask_0, delta_t, onc_cond=None, organ=None, img = None, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
         tumor_mask_0 = tumor_mask_0.permute(0, 1, -1, -3, -2)
         tumor_mask_1 = tumor_mask_1.permute(0, 1, -1, -3, -2)
@@ -902,11 +914,30 @@ class GaussianDiffusion(nn.Module):
 
         target_mask = tumor_mask_1
 
-        # 2. Concatenate spatial conditions along the channel dimension (dim=1)
-        #    tumor_mask_0 anchors "where the tumor was", organ_mask_0 anchors
-        #    organ geometry, heatmap (built from tumor_mask_1) tells the model
-        #    where the target tumor should end up.
-        cond = torch.cat([tumor_mask_0, organ_mask_0, heatmap], dim=1)
+        if isinstance(self.vqgan, VQGAN) and img is not None:
+            img = img.permute(0, 1, 4, 2, 3)
+            img = F.interpolate( # interpolate img back up to 128^3 resolution
+                img,
+                size=self.full_size,
+                mode='trilinear'
+            )
+
+            with torch.no_grad():
+                emb_min = self.vqgan.codebook.embeddings.min()
+                emb_max = self.vqgan.codebook.embeddings.max()
+                emb_denom = emb_max - emb_min
+
+
+                img = self.vqgan.encode(
+                    img,        quantize=False, include_embeddings=True)
+
+                img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
+
+            cond = torch.cat([tumor_mask_0, organ_mask_0, heatmap, img], dim=1)
+
+
+        else:
+            cond = torch.cat([tumor_mask_0, organ_mask_0, heatmap], dim=1)
 
         # 3. Apply diffusion to the TARGET MASK (tumor_mask_1)
         b, device = target_mask.shape[0], target_mask.device
@@ -1147,6 +1178,13 @@ class Trainer(object):
                 organ_mask_0 = data['organ_mask_0'].cuda()
                 organ_mask_1 = data["organ_mask_1"].cuda()
 
+                img = None
+                if(isinstance(self.model.vqgan, VQGAN)):
+                    if("ct0" in data):
+                        img = data["ct0"].cuda()
+                    else:
+                        raise RuntimeError("Excepted key ct0 in dataloader with self.model.vqgan")
+
                 heatmap = data["heatmap"].cuda()
                 delta_t = data["delta_t"].cuda().float()
 
@@ -1165,6 +1203,7 @@ class Trainer(object):
                         delta_t=delta_t,                     # Continuous condition
                         organ=organ,                         # One-hot condition
                         onc_cond=onc_cond,
+                        img=img,
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                         null_cond_prob=0.1
@@ -1208,7 +1247,7 @@ class Trainer(object):
             # ==========================================
             # DEBUG: GENERATE AND SAVE NIFTI MASKS
             # ==========================================
-            if self.step > 0 and self.step % 2000 == 0:
+            if self.step % 2000 == 0:
                 print(
                     f"--> [Step {self.step}] Generating debug NIfTI reconstructions...")
                 self.ema_model.eval()
@@ -1222,8 +1261,30 @@ class Trainer(object):
                     tumor_mask_0_p = tumor_mask_0.permute(0, 1, -1, -3, -2)
                     organ_mask_0_p = organ_mask_0.permute(0, 1, -1, -3, -2)
 
-                    cond = torch.cat(
-                        [tumor_mask_0_p, organ_mask_0_p, heatmap_p], dim=1)
+                                
+                    if isinstance(self.model.vqgan, VQGAN) and img is not None:
+                        img = img.permute(0, 1, 4, 2, 3)
+                        img = F.interpolate( # interpolate img back up to 128^3 resolution
+                            img,
+                            size=self.model.full_size,
+                            mode='trilinear'
+                        )
+
+                        with torch.no_grad():
+                            emb_min = self.model.vqgan.codebook.embeddings.min()
+                            emb_max = self.model.vqgan.codebook.embeddings.max()
+                            emb_denom = emb_max - emb_min
+
+                            img = self.model.vqgan.encode(
+                                img,        quantize=False, include_embeddings=True)
+
+                            img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
+                        cond = torch.cat([tumor_mask_0, organ_mask_0, heatmap, img], dim=1)
+
+
+                    else:
+                        cond = torch.cat([tumor_mask_0_p, organ_mask_0_p, heatmap_p], dim=1)
+                
 
                     T_START = self.ema_model.num_timesteps
 
