@@ -475,6 +475,8 @@ class Unet3D(nn.Module):
         )
 
 
+        self.null_tab_emb = nn.Parameter(torch.randn(self.time_emb_dim) * 0.02)
+
         #nn.init.zeros_(self.cond_mlp[-1].weight)
         #nn.init.zeros_(self.cond_mlp[-1].bias)
 
@@ -598,9 +600,8 @@ class Unet3D(nn.Module):
 
             # Reshape mask to (B, 1) for the embedding
             emb_mask = drop_mask.view(batch, 1)
-
-            # Zero out the combined embedding for the dropped batch items
-            tab_emb = torch.where(emb_mask, torch.zeros_like(tab_emb), tab_emb)
+            null_emb = self.null_tab_emb.unsqueeze(0).expand(batch, -1)
+            tab_emb = torch.where(emb_mask, null_emb, tab_emb)
 
             # Add to the timestep embedding
             t = t + tab_emb
