@@ -31,4 +31,6 @@ phase: train
 
 zero_delta_t_prob: 0.05
 
+include_ct: False
+
 persistent_cache_dir: /scratch/rpinise1/EvoTumor/EvoMask_V5

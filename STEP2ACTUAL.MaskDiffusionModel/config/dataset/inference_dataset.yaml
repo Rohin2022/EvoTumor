@@ -29,4 +29,7 @@ roi_z: 32
 num_samples: 1
 phase: train
 
+zero_delta_t_prob: 0.0
+
+
 persistent_cache_dir: /scratch/rpinise1/EvoTumor/EvoMask_V2

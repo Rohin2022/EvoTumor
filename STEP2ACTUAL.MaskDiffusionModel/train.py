@@ -60,7 +60,8 @@ def run(cfg: DictConfig):
         num_workers=cfg.model.num_workers,
         voxel_spacing=(cfg.dataset.space_x,
                        cfg.dataset.space_y, cfg.dataset.space_z),
-        num_organs=9
+        num_organs=9,
+        max_grad_norm=1.0
     )
 
     if cfg.model.load_milestone:
