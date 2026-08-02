@@ -45,7 +45,7 @@ NOISE_SEED = 42
 MAX_ITEMS = None
 
 
-@hydra.main(config_path='config', config_name='base_cfg', version_base=None)
+@hydra.main(config_path='config', config_name='inference_cfg', version_base=None)
 def run(cfg: DictConfig):
     torch.cuda.set_device(cfg.model.gpus)
 
@@ -62,6 +62,7 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=64,
             dim_mults=cfg.model.dim_mults,
+            total_onc_cond=199,
             channels=cfg.model.diffusion_num_channels,
             out_dim=1,
             num_organs=9,
@@ -132,6 +133,8 @@ def run(cfg: DictConfig):
                 data['organ_id'], dtype=torch.long, device=device).view(-1)
             organ_one_hot = F.one_hot(organ_id, num_classes=9).float()  # (1, 9)
 
+            onc_cond = data["onc_cond"].to(device)
+            onc_cond_rep = onc_cond.repeat(num_deltas, 1)
             tumor_mask_0_rep = tumor_mask_0.repeat(num_deltas, 1, 1, 1, 1)
             organ_mask_0_rep = organ_mask_0.repeat(num_deltas, 1, 1, 1, 1)
             heatmap_rep = heatmap.repeat(num_deltas, 1, 1, 1, 1)
@@ -167,7 +170,7 @@ def run(cfg: DictConfig):
                     (num_deltas,), i, device=device, dtype=torch.long)
                 recon_latent = diffusion.p_sample(
                     recon_latent, t_i,
-                    cond=cond, delta_t=delta_t_batch, organ=organ_one_hot_rep,
+                    cond=cond, delta_t=delta_t_batch, organ=organ_one_hot_rep, onc_cond=onc_cond_rep,
                     cond_scale=cond_scale,
                 )
 

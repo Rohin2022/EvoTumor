@@ -1,0 +1,3 @@
+defaults:
+  - dataset: inference_dataset 
+  - model: inference_ddpm
