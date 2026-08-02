@@ -455,7 +455,7 @@ class Unet3D(nn.Module):
         # combine delta_t embedding with organ one-hot
 
         self.cond_mlp = nn.Sequential(
-            nn.Linear(time_dim + self.num_organs + self.total_onc_cond, time_dim), # delta_t embedding + organ one hot embedding + onc one hot / multi hot embedding
+            nn.Linear(time_dim + self.num_organs + self.total_onc_cond + 3, time_dim), # delta_t embedding + organ one hot embedding + onc one hot / multi hot embedding + delta_t sign ternary one hot
             nn.SiLU(),
             #nn.LayerNorm(time_dim),
             nn.Linear(time_dim, time_dim)
@@ -475,7 +475,7 @@ class Unet3D(nn.Module):
         )
 
 
-        self.null_tab_emb = nn.Parameter(torch.randn(self.time_emb_dim) * 0.02)
+        self.null_tab_emb = nn.Parameter(torch.randn(time_dim) * 0.02)
 
         #nn.init.zeros_(self.cond_mlp[-1].weight)
         #nn.init.zeros_(self.cond_mlp[-1].bias)
@@ -590,8 +590,10 @@ class Unet3D(nn.Module):
 
             delta_t_emb = self.delta_t_mlp(delta_t * 20)  # Shape: (B, time_emb_dim)
 
+            delta_t_sign_one_hot = delta_t_sign_onehot(delta_t)
+
             # organ is expected as a one-hot float tensor (B, num_organs)
-            cond_input = torch.cat([delta_t_emb, organ, onc_cond], dim=1)
+            cond_input = torch.cat([delta_t_emb, organ, onc_cond, delta_t_sign_one_hot], dim=1)
             tab_emb = self.cond_mlp(cond_input)  # Shape: (B, time_emb_dim)
 
             # aux prediction on the UNDROPPED tab_emb -- supervise cond_mlp's
@@ -638,6 +640,24 @@ class Unet3D(nn.Module):
         main_out = self.final_conv(x)
         return main_out, delta_t_pred
 
+
+def delta_t_sign_onehot(delta_t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Build a one-hot encoding of delta_t's sign regime: {negative, zero, positive}.
+
+    Args:
+        delta_t: (B,) tensor of raw delta_t values.
+        eps: tolerance around 0 to treat as "zero" (use this if your delta_t=0
+             identity pairs might carry tiny float noise; set to 0.0 if delta_t=0
+             is always exact in your data pipeline).
+
+    Returns:
+        (B, 3) one-hot tensor, columns ordered [negative, zero, positive].
+    """
+    neg = (delta_t < -eps).float()
+    zero = (delta_t.abs() <= eps).float()
+    pos = (delta_t > eps).float()
+    return torch.stack([neg, zero, pos], dim=-1)  # (B, 3)
 # gaussian diffusion trainer class
 
 
@@ -1188,7 +1208,7 @@ class Trainer(object):
             # ==========================================
             # DEBUG: GENERATE AND SAVE NIFTI MASKS
             # ==========================================
-            if self.step % 2000 == 0:
+            if self.step > 0 and self.step % 2000 == 0:
                 print(
                     f"--> [Step {self.step}] Generating debug NIfTI reconstructions...")
                 self.ema_model.eval()

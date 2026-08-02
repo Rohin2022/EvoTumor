@@ -23,6 +23,7 @@ from monai.transforms import (
     RandFlipd,
     RandCropByPosNegLabeld,
     DeleteItemsd,
+    SelectItemsd,
     RandShiftIntensityd,
     ScaleIntensityRanged,
     Spacingd,
@@ -481,6 +482,86 @@ def get_onc_conditioning(patient_id, args):
     return encoder.encode(conditioning).numpy().astype(np.float32)
  
 
+
+from monai.transforms import MapTransform, RandomizableTransform
+ 
+ 
+class ZeroDeltaTIdentityd(RandomizableTransform, MapTransform):
+    def __init__(
+        self,
+        tumor_mask_0_key: str = "tumor_mask_0",
+        tumor_mask_1_key: str = "tumor_mask_1",
+        organ_mask_0_key: str = "organ_mask_0",
+        organ_mask_1_key: str = "organ_mask_1",
+        delta_t_key: str = "delta_t",
+        prob: float = 0.1,
+        flag_key: str = "is_zero_delta_t_synthetic",
+        allow_missing_keys: bool = False,
+    ):
+        """
+        Args:
+            tumor_mask_0_key / organ_mask_0_key: source (ct0) keys to copy from.
+            tumor_mask_1_key / organ_mask_1_key: target (ct1) keys to overwrite.
+            delta_t_key: dict key holding the scalar delta_t value.
+            prob: probability of hijacking each sample (args.zero_delta_t_prob).
+            flag_key: dict key to record whether this sample was hijacked
+                (bool), for downstream logging/analysis/loss-weighting.
+                Harmless extra key -- ignored by transforms that don't
+                reference it.
+            allow_missing_keys: passed through to MapTransform.
+        """
+        MapTransform.__init__(
+            self,
+            keys=[tumor_mask_0_key, tumor_mask_1_key, organ_mask_0_key, organ_mask_1_key],
+            allow_missing_keys=allow_missing_keys,
+        )
+        RandomizableTransform.__init__(self, prob=prob)
+ 
+        self.tumor_mask_0_key = tumor_mask_0_key
+        self.tumor_mask_1_key = tumor_mask_1_key
+        self.organ_mask_0_key = organ_mask_0_key
+        self.organ_mask_1_key = organ_mask_1_key
+        self.delta_t_key = delta_t_key
+        self.flag_key = flag_key
+ 
+    def __call__(self, data):
+        d = dict(data)
+        self.randomize(None)
+ 
+        d[self.flag_key] = bool(self._do_transform)
+ 
+        if not self._do_transform:
+            return d
+ 
+        # --- hijack masks: t0 <- t1 (deep copy so later in-place transforms
+        # on tumor_mask_1/organ_mask_1 don't also mutate tumor_mask_0/organ_mask_0) ---
+        d[self.tumor_mask_0_key] = deepcopy(d[self.tumor_mask_1_key])
+        d[self.organ_mask_0_key] = deepcopy(d[self.organ_mask_1_key])
+ 
+        # --- override delta_t = 0 ---
+        d[self.delta_t_key] = 0.0
+ 
+        # onc_cond intentionally left untouched -- see module docstring.
+ 
+        return d
+
+
+class PrintNonTensorTypes:
+    """Debug transform: prints types of any non-tensor items in the sample."""
+    def __call__(self, data):
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if not torch.is_tensor(v):
+                    print(f"[NON-TENSOR] key={k!r} type={type(v)} value={v!r}")
+        elif isinstance(data, (list, tuple)):
+            for i, v in enumerate(data):
+                if not torch.is_tensor(v):
+                    print(f"[NON-TENSOR] index={i} type={type(v)} value={v!r}")
+        else:
+            if not torch.is_tensor(data):
+                print(f"[NON-TENSOR] type={type(data)} value={data!r}")
+        return data
+
 def get_loader(args):
 
     MASK_KEYS = ["tumor_mask_0", "tumor_mask_1", "organ_mask_0", "organ_mask_1"]
@@ -535,12 +616,21 @@ def get_loader(args):
         LogMissingClass1d(label_key="tumor_mask_1", tag="post_pad_pre_crop",
                         log_path="missing_class1_log.csv"),
     ]
+    
 
     # ----------------------------------------------------------------------
     # STOCHASTIC: anything randomized (crop) plus everything downstream of it
     # ----------------------------------------------------------------------
     stochastic_transforms = [
         # Random crop biased toward tumor, using tumor_mask_1 as the driving key
+        ZeroDeltaTIdentityd(
+            tumor_mask_0_key="tumor_mask_0",
+            tumor_mask_1_key="tumor_mask_1",
+            organ_mask_0_key="organ_mask_0",
+            organ_mask_1_key="organ_mask_1",
+            delta_t_key="delta_t",
+            prob=args.zero_delta_t_prob,
+        ),
         RandCropByLabelClassesd(
             keys=MASK_KEYS,
             label_key="tumor_mask_1",
@@ -565,7 +655,9 @@ def get_loader(args):
 
         ComputeTSDFd(keys=MASK_KEYS),
 
-        ToTensord(keys=MASK_KEYS + ["heatmap"]),
+        ToTensord(keys=MASK_KEYS + ["heatmap", "delta_t", "organ_id","onc_cond"]),
+        SelectItemsd(keys=MASK_KEYS+["heatmap","onc_cond","delta_t", "organ_id"]),
+
     ]
     # breakpoint()
     if args.phase == 'train':
