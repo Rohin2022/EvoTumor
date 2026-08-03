@@ -869,8 +869,12 @@ def get_loader(args):
             "sample_weight",
             "organ_id",
             "onc_cond",
-            "ct0"
         ]
+        if(args.include_img):
+            keep_cols.append("ct0")
+        else:
+            print("NOT including CT0 in data")
+
         train_input = train_input[keep_cols]
 
         # 6. Rename to the keys LoadAndRegisterPaird / downstream code expect
