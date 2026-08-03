@@ -5,8 +5,11 @@ diffusion_num_channels: 4
 out_dim: 1
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/
-results_folder_postfix: 'evo_tumor_mask_diffusion_v9' # 1000 timesteps v1 (actually is 32 dim)
+results_folder_postfix: 'evo_tumor_mask_diffusion_v10' # 1000 timesteps v1 (actually is 32 dim)
 load_milestone: False
+
+vqgan_ckpt: /projects/bodymaps/Rohin/EvoTumor/STEP3.ImageDiffusionModel/pretrained_models/UCSF_V7_133k_250kSTEPS_recon_loss=0.09.ckpt
+
 
 batch_size: 8 # 40
 num_workers: 16

@@ -8,6 +8,8 @@ segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_
 organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
 transform_root_path: /scratch/rpinise1/EvoTumor/Residuals/transforms
 
+image_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro
+
 bdmap_mapping_csv: /projects/bodymaps/Data/EHR/EHR/EHR_matched_data/CT_scans_BDMAP_ID_with_patient_durable_key.csv
 bdmap_col: 'BDMAP ID'
 patient_col: 'PatientDurableKey'
@@ -15,6 +17,9 @@ onc_conditioning_dir: /projects/bodymaps/Rohin/EvoTumor/STEP0.PrepareData/oncolo
 
 data_txt_path: cross_eval/
 datafile: Datapairs_with_masks.csv
+
+vqgan_ckpt: null
+
 
 dist: False
 batch_size: 1

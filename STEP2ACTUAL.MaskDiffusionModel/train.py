@@ -18,13 +18,15 @@ def run(cfg: DictConfig):
     with open_dict(cfg):
         cfg.model.results_folder = os.path.join(
             cfg.model.results_folder, cfg.dataset.name, cfg.model.results_folder_postfix)
+        cfg.dataset.include_img = cfg.model.vqgan_ckpt is not None
+
 
     if cfg.model.denoising_fn == 'Unet3D':
         model = Unet3D(
             dim=64,
             dim_mults=cfg.model.dim_mults,
             # target (1) + img_cond (tumor_mask_0 + organ_mask_0 + heatmap)
-            channels=cfg.model.diffusion_num_channels,
+            channels=cfg.model.diffusion_num_channels if cfg.model.vqgan_ckpt is None else (cfg.model.diffusion_num_channels + 8),
             total_onc_cond=199,
             out_dim=1,
             num_organs=9
@@ -32,14 +34,19 @@ def run(cfg: DictConfig):
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
 
+
+
     diffusion = GaussianDiffusion(
         model,
         image_size=cfg.model.diffusion_img_size,
         num_frames=cfg.model.diffusion_depth_size,
-        channels=cfg.model.diffusion_num_channels,
+        channels=1, # use 1 more channel for the image
         timesteps=cfg.model.timesteps,
-        loss_type=cfg.model.loss_type
+        loss_type=cfg.model.loss_type,
+        vqgan_ckpt = cfg.model.vqgan_ckpt
     ).cuda()
+
+
 
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
     val_dataloader = None

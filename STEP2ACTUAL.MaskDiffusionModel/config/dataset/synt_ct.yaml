@@ -13,6 +13,9 @@ bdmap_col: 'BDMAP ID'
 patient_col: 'PatientDurableKey'
 onc_conditioning_dir: /projects/bodymaps/Rohin/EvoTumor/STEP0.PrepareData/oncology/final_oncology_processed_mask
 
+image_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro
+
+
 data_txt_path: cross_eval/
 datafile: Datapairs_with_masks.csv
 
@@ -31,6 +34,5 @@ phase: train
 
 zero_delta_t_prob: 0.05
 
-include_ct: False
 
-persistent_cache_dir: /scratch/rpinise1/EvoTumor/EvoMask_V5
+persistent_cache_dir: /scratch/rpinise1/EvoTumor/EvoMask_V6
